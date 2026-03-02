@@ -5,7 +5,6 @@ edition = "2024"
 authors = ["rk8s-dev team"]
 description = "the libvault is modified from RustyVault"
 repository = "https://github.com/rk8s-dev/rk8s/tree/main/project/libvault"
-documentation = ""
 build = "build.rs"
 license = "MIT OR Apache-2.0"
 
