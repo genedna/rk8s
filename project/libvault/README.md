@@ -226,8 +226,9 @@ Backends implement the `storage::Backend` trait and can be swapped at runtime.
   policies that restrict capabilities.
 * **In‑memory only for private keys** – When RKL nodes receive a client certificate,
   the private key is never written to disk; it lives only in process memory.
-* **Audit logging** – The `tracing` crate is used throughout the codebase (via
-  `Handler::log`) to emit structured events for every request phase.
+* **Audit logging** – Structured audit events for each request phase are emitted via
+  `Handler::log` on top of the `tracing` crate, while some components still emit
+  traditional logs via the `log` crate. Configure observability to handle both.
 
 ---
 
