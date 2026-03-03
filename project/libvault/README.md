@@ -82,11 +82,13 @@ key‑value store for the control plane (RKS) and data nodes (RKL).
 `libvault` exposes a single entry point: `RustyVault`.
 
 ```rust
-use libvault::{RustyVault, Config, core::SealConfig};
-use std::sync::Arc;
+use libvault::{RustyVault, Config, core::SealConfig, storage};
+use std::collections::HashMap;
 
 // 1️⃣ Choose a physical backend (file‑based for bootstrap)
-let backend = Arc::new(libvault::storage::file::FileBackend::new("/var/lib/rks/vault"))?;
+let mut conf = HashMap::new();
+conf.insert("path".to_string(), serde_json::json!("/var/lib/rks/vault"));
+let backend = storage::new_backend("file", &conf)?;
 
 // 2️⃣ Optional configuration (mount HMAC level, monitor interval, …)
 let config = Some(&Config::default());
@@ -108,7 +110,8 @@ vault.set_token(init_res.root_token);
 
 // 7️⃣ Example: mount a KV engine and store a secret
 vault.mount(None, "secret", "kv").await?;
-vault.write(None, "secret/data/mykey", serde_json::json!({ "value": "super‑secret" })).await?;
+let data = serde_json::json!({ "value": "super‑secret" }).as_object().cloned();
+vault.write(None, "secret/data/mykey", data).await?;
 let resp = vault.read(None, "secret/data/mykey").await?;
 println!("Secret: {:?}", resp);
 ```
@@ -154,9 +157,10 @@ All async methods return `Result<_, libvault::errors::RvError>`.
 vault.mount(None, "secret", "kv").await?;
 
 // Write a secret
-vault.write(None, "secret/data/app/config", serde_json::json!({
+let data = serde_json::json!({
     "api_key": "abcd‑1234‑efgh‑5678"
-})).await?;
+}).as_object().cloned();
+vault.write(None, "secret/data/app/config", data).await?;
 
 // Read it back
 let resp = vault.read(None, "secret/data/app/config").await?;
