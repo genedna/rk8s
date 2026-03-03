@@ -251,7 +251,7 @@ The crate follows the repository‑wide policies:
 
 * `rustfmt` with defaults.
 * `clippy` warnings are treated as errors for new code.
-* No `unwrap()` / `expect()` in library code – errors are propagated as `RvError`.
+* Avoid `unwrap()` / `expect()` in new library code and public APIs; propagate errors as `RvError` instead.
 
 ---
 
