@@ -103,7 +103,12 @@ println!("Root token: {}", init_res.root_token);
 
 // 5️⃣ Unseal with enough key shares
 let unseal_keys = vec![ /* share 1 */, /* share 2 */, /* share 3 */ ];
-vault.unseal_once(&unseal_keys.concat()).await?; // rotates keys automatically
+for key in unseal_keys {
+    if vault.unseal_once(key).await?.is_some() {
+        break;
+    }
+}
+// Note: `unseal_once` rotates keys automatically upon successful unseal
 
 // 6️⃣ Set the root token for subsequent calls
 vault.set_token(init_res.root_token);
