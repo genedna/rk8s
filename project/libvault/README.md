@@ -241,9 +241,6 @@ cargo build -p libvault
 # Run unit tests (including async tests)
 cargo test -p libvault
 
-# Run property‑based tests
-cargo test -p libvault --features proptest
-
 # Benchmark hot paths (e.g., seal/unseal, KV read/write)
 cargo bench -p libvault
 ```
