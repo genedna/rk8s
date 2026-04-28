@@ -26,10 +26,7 @@ use std::os::unix::fs::OpenOptionsExt;
     all(target_os = "linux", feature = "unprivileged")
 ))]
 use std::os::unix::io::RawFd;
-#[cfg(any(
-    target_os = "macos",
-    all(target_os = "linux", feature = "unprivileged")
-))]
+#[cfg(target_os = "macos")]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),

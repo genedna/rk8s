@@ -1,6 +1,8 @@
+use std::io;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
-use std::{ffi::OsStr, io, path::Path};
+#[cfg(any(target_os = "macos", test))]
+use std::{ffi::OsStr, path::Path};
 
 #[cfg(target_os = "macos")]
 use std::{io::IoSliceMut, os::unix::io::RawFd, process::Output};
@@ -23,8 +25,10 @@ pub(crate) type CompleteIoResult<T, U> = (T, io::Result<U>);
 #[cfg(target_os = "macos")]
 pub(super) const MACFUSE_COMMFD_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(any(target_os = "macos", test))]
 const MAX_CAPTURED_OUTPUT_LEN: usize = 4096;
 
+#[cfg(any(target_os = "macos", test))]
 fn display_process_stream(bytes: &[u8]) -> String {
     let mut output = String::from_utf8_lossy(bytes).trim().to_owned();
     if output.is_empty() {
@@ -43,6 +47,7 @@ fn display_process_stream(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macfuse_command_failure_message(
     binary_path: &Path,
     mount_path: &OsStr,
