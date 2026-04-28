@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 use std::env;
+#[cfg(target_os = "macos")]
+use std::ffi::OsStr;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use std::ffi::OsString;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -19,7 +21,10 @@ use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(target_os = "freebsd")]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(all(target_os = "linux", feature = "unprivileged"))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "unprivileged")
+))]
 use std::os::unix::io::RawFd;
 #[cfg(any(
     target_os = "macos",
@@ -89,6 +94,66 @@ use crate::find_fusermount3;
     target_os = "macos"
 ))]
 use crate::MountOptions;
+
+#[cfg(target_os = "macos")]
+fn macfuse_fd_receive_error(binary_path: &Path, mount_path: &OsStr, err: io::Error) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!(
+            "failed to receive FUSE fd from mount_macfuse: binary={}, mount={}: {}",
+            binary_path.display(),
+            mount_path.to_string_lossy(),
+            err
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macfuse_fd_timeout_error(binary_path: &Path, mount_path: &OsStr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "timed out after {:?} waiting for mount_macfuse to send FUSE fd: binary={}, mount={}",
+            MACFUSE_COMMFD_TIMEOUT,
+            binary_path.display(),
+            mount_path.to_string_lossy()
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_macfuse_fd_task(
+    fd_task: &mut task::JoinHandle<io::Result<RawFd>>,
+    binary_path: &Path,
+    mount_path: &OsStr,
+) -> io::Result<RawFd> {
+    fd_task
+        .await
+        .map_err(|err| {
+            io::Error::other(format!("wait for mount_macfuse FUSE fd task failed: {err}"))
+        })?
+        .map_err(|err| macfuse_fd_receive_error(binary_path, mount_path, err))
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_macfuse_fd_task_until_timeout(
+    fd_task: &mut task::JoinHandle<io::Result<RawFd>>,
+    binary_path: &Path,
+    mount_path: &OsStr,
+) -> io::Result<RawFd> {
+    match tokio::time::timeout(
+        MACFUSE_COMMFD_TIMEOUT,
+        wait_for_macfuse_fd_task(fd_task, binary_path, mount_path),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            fd_task.abort();
+            Err(macfuse_fd_timeout_error(binary_path, mount_path))
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct FuseConnection {
@@ -300,6 +365,7 @@ impl BlockFuseConnection {
                     ),
                 )
             })?;
+        drop(sock0);
 
         let (child_result_tx, mut child_result_rx) = tokio::sync::oneshot::channel();
         let child_task = tokio::spawn(async move {
@@ -307,36 +373,37 @@ impl BlockFuseConnection {
             let _ = child_result_tx.send(output);
         });
 
-        let fd_task = task::spawn_blocking(move || {
+        let mut fd_task = task::spawn_blocking(move || {
             debug!("wait_thread start");
             recv_fuse_fd_blocking(sock1.as_raw_fd())
         });
 
-        let fd = tokio::select! {
-            fd_result = fd_task => {
+        let fd_result = tokio::select! {
+            fd_result = wait_for_macfuse_fd_task(
+                &mut fd_task,
+                &binary_path_for_error,
+                mount_path_for_error.as_os_str(),
+            ) => {
                 fd_result
-                    .map_err(|err| io::Error::other(format!("wait for mount_macfuse FUSE fd task failed: {err}")))?
-                    .map_err(|err| io::Error::new(
-                        err.kind(),
-                        format!(
-                            "failed to receive FUSE fd from mount_macfuse: binary={}, mount={}: {}",
-                            binary_path_for_error.display(),
-                            mount_path_for_error.to_string_lossy(),
-                            err
-                        )
-                    ))?
             }
             child_result = &mut child_result_rx => {
                 match child_result {
+                    Ok(Ok(output)) if output.status.success() => {
+                        wait_for_macfuse_fd_task_until_timeout(
+                            &mut fd_task,
+                            &binary_path_for_error,
+                            mount_path_for_error.as_os_str(),
+                        ).await
+                    }
                     Ok(Ok(output)) => {
-                        return Err(macfuse_command_failure_error(
+                        Err(macfuse_command_failure_error(
                             &binary_path_for_error,
                             mount_path_for_error.as_os_str(),
                             &output,
-                        ));
+                        ))
                     }
                     Ok(Err(err)) => {
-                        return Err(io::Error::new(
+                        Err(io::Error::new(
                             err.kind(),
                             format!(
                                 "wait for mount_macfuse failed: binary={}, mount={}: {}",
@@ -344,28 +411,31 @@ impl BlockFuseConnection {
                                 mount_path_for_error.to_string_lossy(),
                                 err
                             ),
-                        ));
+                        ))
                     }
                     Err(_) => {
-                        return Err(io::Error::other(format!(
+                        Err(io::Error::other(format!(
                             "mount_macfuse monitor task dropped before sending FUSE fd: binary={}, mount={}",
                             binary_path_for_error.display(),
                             mount_path_for_error.to_string_lossy()
-                        )));
+                        )))
                     }
                 }
             }
             _ = sleep(MACFUSE_COMMFD_TIMEOUT) => {
+                fd_task.abort();
+                Err(macfuse_fd_timeout_error(
+                    &binary_path_for_error,
+                    mount_path_for_error.as_os_str(),
+                ))
+            }
+        };
+
+        let fd = match fd_result {
+            Ok(fd) => fd,
+            Err(err) => {
                 child_task.abort();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "timed out after {:?} waiting for mount_macfuse to send FUSE fd: binary={}, mount={}",
-                        MACFUSE_COMMFD_TIMEOUT,
-                        binary_path_for_error.display(),
-                        mount_path_for_error.to_string_lossy()
-                    ),
-                ));
+                return Err(err);
             }
         };
 

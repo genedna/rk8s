@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 use std::env;
+#[cfg(target_os = "macos")]
+use std::ffi::OsStr;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use std::ffi::OsString;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -78,6 +80,33 @@ use crate::raw::connection::{
     target_os = "macos"
 ))]
 use crate::MountOptions;
+
+#[cfg(target_os = "macos")]
+fn macfuse_fd_receive_error(binary_path: &Path, mount_path: &OsStr, err: io::Error) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!(
+            "failed to receive FUSE fd from mount_macfuse: binary={}, mount={}: {}",
+            binary_path.display(),
+            mount_path.to_string_lossy(),
+            err
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macfuse_fd_timeout_error(binary_path: &Path, mount_path: &OsStr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "timed out after {:?} waiting for mount_macfuse to send FUSE fd: binary={}, mount={}",
+            MACFUSE_COMMFD_TIMEOUT,
+            binary_path.display(),
+            mount_path.to_string_lossy()
+        ),
+    )
+}
+
 #[derive(Debug)]
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
@@ -286,6 +315,7 @@ impl BlockFuseConnection {
                     ),
                 )
             })?;
+        drop(sock0);
 
         let (child_result_tx, child_result_rx) = futures_channel::oneshot::channel();
         let child_task = async_global_executor::spawn(async move {
@@ -303,30 +333,48 @@ impl BlockFuseConnection {
         let timeout = async_io::Timer::after(MACFUSE_COMMFD_TIMEOUT);
         let mut timeout = timeout.fuse();
 
-        let fd = select! {
+        let fd_result = select! {
             fd_result = fd_task => {
-                child_task.detach();
-                fd_result.map_err(|err| io::Error::new(
-                    err.kind(),
-                    format!(
-                        "failed to receive FUSE fd from mount_macfuse: binary={}, mount={}: {}",
-                        binary_path_for_error.display(),
-                        mount_path_for_error.to_string_lossy(),
-                        err
+                fd_result.map_err(|err| {
+                    macfuse_fd_receive_error(
+                        &binary_path_for_error,
+                        mount_path_for_error.as_os_str(),
+                        err,
                     )
-                ))?
+                })
             }
             child_result = child_result_rx => {
                 match child_result {
+                    Ok(Ok(output)) if output.status.success() => {
+                        let retry_timeout = async_io::Timer::after(MACFUSE_COMMFD_TIMEOUT);
+                        let mut retry_timeout = retry_timeout.fuse();
+                        select! {
+                            fd_result = fd_task => {
+                                fd_result.map_err(|err| {
+                                    macfuse_fd_receive_error(
+                                        &binary_path_for_error,
+                                        mount_path_for_error.as_os_str(),
+                                        err,
+                                    )
+                                })
+                            }
+                            _ = retry_timeout => {
+                                Err(macfuse_fd_timeout_error(
+                                    &binary_path_for_error,
+                                    mount_path_for_error.as_os_str(),
+                                ))
+                            }
+                        }
+                    }
                     Ok(Ok(output)) => {
-                        return Err(macfuse_command_failure_error(
+                        Err(macfuse_command_failure_error(
                             &binary_path_for_error,
                             mount_path_for_error.as_os_str(),
                             &output,
-                        ));
+                        ))
                     }
                     Ok(Err(err)) => {
-                        return Err(io::Error::new(
+                        Err(io::Error::new(
                             err.kind(),
                             format!(
                                 "wait for mount_macfuse failed: binary={}, mount={}: {}",
@@ -334,27 +382,33 @@ impl BlockFuseConnection {
                                 mount_path_for_error.to_string_lossy(),
                                 err
                             ),
-                        ));
+                        ))
                     }
                     Err(_) => {
-                        return Err(io::Error::other(format!(
+                        Err(io::Error::other(format!(
                             "mount_macfuse monitor task dropped before sending FUSE fd: binary={}, mount={}",
                             binary_path_for_error.display(),
                             mount_path_for_error.to_string_lossy()
-                        )));
+                        )))
                     }
                 }
             }
             _ = timeout => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "timed out after {:?} waiting for mount_macfuse to send FUSE fd: binary={}, mount={}",
-                        MACFUSE_COMMFD_TIMEOUT,
-                        binary_path_for_error.display(),
-                        mount_path_for_error.to_string_lossy()
-                    ),
-                ));
+                Err(macfuse_fd_timeout_error(
+                    &binary_path_for_error,
+                    mount_path_for_error.as_os_str(),
+                ))
+            }
+        };
+
+        let fd = match fd_result {
+            Ok(fd) => {
+                child_task.detach();
+                fd
+            }
+            Err(err) => {
+                let _ = child_task.cancel().await;
+                return Err(err);
             }
         };
 

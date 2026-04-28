@@ -903,7 +903,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             }
             Err(err) => {
                 if let Some(sender) = ready_sender.take() {
-                    let _ = sender.send(Err(IoError::new(err.kind(), err.to_string())));
+                    let return_err = if let Some(raw_os_error) = err.raw_os_error() {
+                        IoError::from_raw_os_error(raw_os_error)
+                    } else {
+                        IoError::new(err.kind(), err.to_string())
+                    };
+                    let _ = sender.send(Err(err));
+                    return Err(return_err);
                 }
                 return Err(err);
             }

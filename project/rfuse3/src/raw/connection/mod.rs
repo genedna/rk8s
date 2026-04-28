@@ -1,4 +1,6 @@
-use std::{ffi::OsStr, io, path::Path, time::Duration};
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+use std::{ffi::OsStr, io, path::Path};
 
 #[cfg(target_os = "macos")]
 use std::{io::IoSliceMut, os::unix::io::RawFd, process::Output};
@@ -30,7 +32,11 @@ fn display_process_stream(bytes: &[u8]) -> String {
     }
 
     if output.len() > MAX_CAPTURED_OUTPUT_LEN {
-        output.truncate(MAX_CAPTURED_OUTPUT_LEN);
+        let mut truncate_at = MAX_CAPTURED_OUTPUT_LEN;
+        while !output.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        output.truncate(truncate_at);
         output.push_str("...<truncated>");
     }
 
@@ -92,7 +98,7 @@ pub(super) fn recv_fuse_fd_blocking(fd: RawFd) -> io::Result<RawFd> {
 mod tests {
     use std::{ffi::OsStr, path::Path};
 
-    use super::macfuse_command_failure_message;
+    use super::{display_process_stream, macfuse_command_failure_message, MAX_CAPTURED_OUTPUT_LEN};
 
     #[test]
     fn macfuse_command_failure_message_includes_child_output() {
@@ -109,5 +115,21 @@ mod tests {
         assert!(message.contains("stderr=mount_macfuse: permission denied"));
         assert!(message.contains("stdout=<empty>"));
         assert!(message.contains("/tmp/libra-task-worktree-fuse/workspace"));
+    }
+
+    #[test]
+    fn display_process_stream_truncates_on_utf8_boundary() {
+        let input = format!(
+            "{}é{}",
+            "a".repeat(MAX_CAPTURED_OUTPUT_LEN - 1),
+            "b".repeat(16)
+        );
+
+        let output = display_process_stream(input.as_bytes());
+
+        assert_eq!(
+            output,
+            format!("{}...<truncated>", "a".repeat(MAX_CAPTURED_OUTPUT_LEN - 1))
+        );
     }
 }
