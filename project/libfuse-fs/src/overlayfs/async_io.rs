@@ -23,14 +23,11 @@ impl Filesystem for OverlayFs {
         if self.config.do_import {
             self.import().await?;
         }
-        #[cfg(target_os = "linux")]
-        {
-            for layer in self.lower_layers.iter() {
-                layer.init(_req).await?;
-            }
-            if let Some(upper) = &self.upper_layer {
-                upper.init(_req).await?;
-            }
+        for layer in self.lower_layers.iter() {
+            layer.init(_req).await?;
+        }
+        if let Some(upper) = &self.upper_layer {
+            upper.init(_req).await?;
         }
         if !self.config.do_import || self.config.writeback {
             self.writeback.store(true, Ordering::Relaxed);
@@ -1245,7 +1242,9 @@ mod tests {
 
         let mut mount_options = MountOptions::default();
         // .allow_other(true)
-        mount_options.force_readdir_plus(true).uid(uid).gid(gid);
+        #[cfg(target_os = "linux")]
+        mount_options.force_readdir_plus(true);
+        mount_options.uid(uid).gid(gid);
 
         let mut mount_handle: rfuse3::raw::MountHandle = if !not_unprivileged {
             Session::new(mount_options)

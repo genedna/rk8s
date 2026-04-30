@@ -22,16 +22,24 @@ use tracing::{debug, error, info, trace};
 use vm_memory::{ByteValued, bitmap::BitmapSlice};
 
 use crate::{
-    passthrough::{CURRENT_DIR_CSTR, EMPTY_CSTR, FileUniqueKey, PARENT_DIR_CSTR, statx::statx},
+    passthrough::{CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR},
     util::{convert_stat64_to_file_attr, filetype_from_mode},
 };
+#[cfg(target_os = "linux")]
+use crate::passthrough::{FileUniqueKey, statx::statx};
 
 use super::ebadf;
 use super::util::{
     self, AT_EMPTY_PATH, SLASH_ASCII, einval, enosys, is_safe_inode, osstr_to_cstr, set_creds,
     stat_fd, stat64,
 };
+#[cfg(target_os = "linux")]
+use super::util::fd_path_cstr;
+#[cfg(target_os = "macos")]
+use super::util::{is_linux_only_xattr, join_dir_and_name};
 use super::{Handle, HandleData, PassthroughFs, config::CachePolicy, os_compat::LinuxDirent64};
+#[cfg(target_os = "macos")]
+use super::{InodeData, inode_store, statx};
 #[cfg(target_os = "macos")]
 pub const O_DIRECT: libc::c_int = 0;
 #[cfg(target_os = "linux")]
@@ -530,10 +538,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     async fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
         let data = self.inode_map.get(parent).await?;
         let file = data.get_file()?;
+        #[cfg(target_os = "linux")]
         let st = statx(&file, Some(name)).ok();
+        #[cfg(target_os = "macos")]
+        let _ = name; // st only used by Linux below; suppress unused-let warning
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::unlinkat(file.as_raw_fd(), name.as_ptr(), flags) };
         if res == 0 {
+            #[cfg(target_os = "linux")]
             if let Some(st) = st
                 && let Some(btime) = st.btime
                 && (btime.tv_sec != 0 || btime.tv_nsec != 0)
@@ -813,6 +825,70 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     ) -> Result<ReplyEntry> {
         self.do_symlink_inner(req, parent, name, link, Some(uid), Some(gid))
             .await
+    }
+
+    /// macOS lazy-fd: rewrite the cached path of `src_id_before` to point at
+    /// `<new_parent>.lazy_path()/<new_name>` after a successful rename. No-op
+    /// if lazy mode is off, the source isn't tracked, or the new parent isn't
+    /// a `Reopenable` inode (which can only happen if the user mixed lazy/eager
+    /// configurations across mounts).
+    ///
+    /// When the renamed entry is a directory, every cached `Reopenable`
+    /// inode whose absolute path is a descendant of the **old** path is
+    /// rewritten to use the new path. Without this, descendants would
+    /// reopen at stale paths after an LRU eviction. The walk takes the
+    /// inode-map read lock and is `O(N_inodes)` — fine for typical
+    /// workloads since rename is rare; if it ever shows up in profiles,
+    /// switch to an explicit parent→children index.
+    #[cfg(target_os = "macos")]
+    async fn macos_lazy_after_rename(
+        &self,
+        new_parent: &Arc<InodeData>,
+        new_name: &OsStr,
+        src_id_before: Option<inode_store::InodeId>,
+    ) {
+        if !self.cfg.macos_lazy_inode_fd {
+            return;
+        }
+        let Some(id) = src_id_before else { return };
+        let Some(new_parent_path) = new_parent.lazy_path() else {
+            return;
+        };
+        let new_path = new_parent_path.join(new_name);
+        let inodes = self.inode_map.inodes.read().await;
+        let Some(data) = inodes.get_by_id(&id) else {
+            return;
+        };
+
+        // Capture the renamed target's old absolute path *before* we
+        // overwrite it — descendants share this string as a prefix.
+        let old_path = data.lazy_path();
+        let target_inode = data.inode;
+        let target_is_dir = util::is_dir(data.mode.into());
+        data.update_lazy_path(new_path.clone());
+
+        if !target_is_dir {
+            return;
+        }
+        let Some(old_path) = old_path else { return };
+
+        // Rewrite every descendant whose path starts with `old_path`. The
+        // target itself was already updated above; skip it by inode number.
+        for (other_ino, other) in inodes.iter() {
+            if *other_ino == target_inode {
+                continue;
+            }
+            let Some(other_path) = other.lazy_path() else {
+                continue;
+            };
+            // `strip_prefix` requires a path-component match (won't match
+            // "/foo" against "/foobar"), which is exactly what we want.
+            if let Ok(suffix) = other_path.strip_prefix(&old_path) {
+                let mut rewritten = new_path.clone();
+                rewritten.push(suffix);
+                other.update_lazy_path(rewritten);
+            }
+        }
     }
 }
 
@@ -1541,11 +1617,14 @@ impl Filesystem for PassthroughFs {
         }
         let name = osstr_to_cstr(name).unwrap();
         let name = name.as_ref();
+        #[cfg(target_os = "macos")]
+        if is_linux_only_xattr(name) {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        }
         let data = self.inode_map.get(inode).await?;
         let file = data.get_file()?;
         #[cfg(target_os = "linux")]
-        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let pathname = fd_path_cstr(file.as_raw_fd())?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to use the {set,get,remove,list}xattr variants.
@@ -1563,12 +1642,14 @@ impl Filesystem for PassthroughFs {
             },
             #[cfg(target_os = "macos")]
             () => unsafe {
+                // `_position` is non-zero only for com.apple.ResourceFork; pass it through
+                // so resource-fork writes work as expected.
                 libc::fsetxattr(
                     file.as_raw_fd(),
                     name.as_ptr(),
                     value.as_ptr() as *const libc::c_void,
                     value.len(),
-                    0,
+                    _position,
                     flags as libc::c_int,
                 )
             },
@@ -1576,9 +1657,9 @@ impl Filesystem for PassthroughFs {
         if res == 0 {
             Ok(())
         } else {
-            let e = io::Error::last_os_error();
-            error!("setxattr error: {:?}, faking success", e);
-            Ok(())
+            // Surface the real errno; the previous "fake success" hid bugs and
+            // made conformance suites (pjdfstest) report misleading results.
+            Err(io::Error::last_os_error().into())
         }
     }
 
@@ -1598,12 +1679,15 @@ impl Filesystem for PassthroughFs {
         let name =
             osstr_to_cstr(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let name = name.as_ref();
+        #[cfg(target_os = "macos")]
+        if is_linux_only_xattr(name) {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        }
         let data = self.inode_map.get(inode).await?;
         let file = data.get_file()?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
         #[cfg(target_os = "linux")]
-        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let pathname = fd_path_cstr(file.as_raw_fd())?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to use the {set,get,remove,list}xattr variants.
@@ -1658,8 +1742,7 @@ impl Filesystem for PassthroughFs {
         let file = data.get_file()?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
         #[cfg(target_os = "linux")]
-        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let pathname = fd_path_cstr(file.as_raw_fd())?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to use the {set,get,remove,list}xattr variants.
@@ -1705,11 +1788,14 @@ impl Filesystem for PassthroughFs {
         }
         let name = osstr_to_cstr(name).unwrap();
         let name = name.as_ref();
+        #[cfg(target_os = "macos")]
+        if is_linux_only_xattr(name) {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        }
         let data = self.inode_map.get(inode).await?;
         let file = data.get_file()?;
         #[cfg(target_os = "linux")]
-        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let pathname = fd_path_cstr(file.as_raw_fd())?;
 
         #[cfg(target_os = "linux")]
         let res = unsafe { libc::removexattr(pathname.as_ptr(), name.as_ptr()) };
@@ -1718,9 +1804,7 @@ impl Filesystem for PassthroughFs {
         if res == 0 {
             Ok(())
         } else {
-            let e = io::Error::last_os_error();
-            error!("removexattr error: {:?}, faking success", e);
-            Ok(())
+            Err(io::Error::last_os_error().into())
         }
     }
 
@@ -2080,29 +2164,62 @@ impl Filesystem for PassthroughFs {
         //      )?;
         //  }
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            #[cfg(target_os = "linux")]
-            {
+        #[cfg(target_os = "linux")]
+        {
+            // Safe because this doesn't modify any memory and we check the return value.
+            let res = unsafe {
                 libc::fallocate64(
                     _fd.as_raw_fd(),
                     _mode as libc::c_int,
                     _offset as libc::off64_t,
                     _length as libc::off64_t,
                 )
+            };
+            if res == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error().into())
             }
-            #[cfg(target_os = "macos")]
-            {
-                // Stub fallocate
-                *libc::__error() = libc::ENOSYS;
-                -1
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS has no fallocate(). Mode bits beyond plain "extend" (PUNCH_HOLE,
+            // COLLAPSE_RANGE, ZERO_RANGE, ...) have no equivalent in F_PREALLOCATE.
+            if _mode != 0 {
+                return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
             }
-        };
+            let raw_fd = _fd.as_raw_fd();
+            let target_size = _offset.saturating_add(_length) as libc::off_t;
 
-        if res == 0 {
+            // Determine current size to compute how much to preallocate from EOF.
+            let st = stat_fd(&_fd, None)?;
+            let current_size = st.st_size as libc::off_t;
+            if target_size > current_size {
+                let mut store = libc::fstore_t {
+                    fst_flags: libc::F_ALLOCATEALL,
+                    fst_posmode: libc::F_PEOFPOSMODE,
+                    fst_offset: 0,
+                    fst_length: target_size - current_size,
+                    fst_bytesalloc: 0,
+                };
+                // Try contiguous first; on ENOSPC, retry without the contiguous hint.
+                store.fst_flags |= libc::F_ALLOCATECONTIG;
+                let mut res = unsafe { libc::fcntl(raw_fd, libc::F_PREALLOCATE, &mut store) };
+                if res < 0 {
+                    store.fst_flags &= !libc::F_ALLOCATECONTIG;
+                    res = unsafe { libc::fcntl(raw_fd, libc::F_PREALLOCATE, &mut store) };
+                }
+                if res < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                // F_PREALLOCATE reserves blocks but does not grow the file; ftruncate
+                // is what actually advances st_size to match Linux fallocate semantics.
+                let res = unsafe { libc::ftruncate(raw_fd, target_size) };
+                if res < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+            }
             Ok(())
-        } else {
-            Err(io::Error::last_os_error().into())
         }
     }
 
@@ -2161,7 +2278,19 @@ impl Filesystem for PassthroughFs {
         let old_file = old_inode.get_file()?;
         let new_file = new_inode.get_file()?;
 
-        //TODO: Switch to libc::renameat2 -> libc::renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+        // macOS lazy-fd: capture the source inode id before the rename so we
+        // can rewrite the moved inode's `ReopenableState.path` on success.
+        // Without this, a cached InodeData would reopen the *old* path after
+        // any cache miss (e.g. once an LRU eviction layer lands).
+        #[cfg(target_os = "macos")]
+        let src_id_before = if self.cfg.macos_lazy_inode_fd {
+            statx::statx(&old_file, Some(oldname))
+                .ok()
+                .map(|s| inode_store::InodeId::from_stat(&s))
+        } else {
+            None
+        };
+
         let res = unsafe {
             libc::renameat(
                 old_file.as_raw_fd(),
@@ -2171,11 +2300,15 @@ impl Filesystem for PassthroughFs {
             )
         };
 
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error().into())
+        if res != 0 {
+            return Err(io::Error::last_os_error().into());
         }
+
+        #[cfg(target_os = "macos")]
+        self.macos_lazy_after_rename(&new_inode, new_name, src_id_before)
+            .await;
+
+        Ok(())
     }
 
     /// rename a file or directory with flags.
@@ -2186,7 +2319,7 @@ impl Filesystem for PassthroughFs {
         name: &OsStr,
         new_parent: Inode,
         new_name: &OsStr,
-        _flags: u32,
+        flags: u32,
     ) -> Result<()> {
         let oldname = osstr_to_cstr(name).unwrap();
         let oldname = oldname.as_ref();
@@ -2197,32 +2330,100 @@ impl Filesystem for PassthroughFs {
 
         let old_inode = self.inode_map.get(parent).await?;
         let new_inode = self.inode_map.get(new_parent).await?;
-        let _old_file = old_inode.get_file()?;
-        let _new_file = new_inode.get_file()?;
-        //TODO: Switch to libc::renameat2 -> libc::renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
-        let res = unsafe {
-            #[cfg(target_os = "linux")]
-            {
-                libc::renameat2(
-                    _old_file.as_raw_fd(),
-                    oldname.as_ptr(),
-                    _new_file.as_raw_fd(),
-                    newname.as_ptr(),
-                    _flags,
-                )
-            }
-            #[cfg(target_os = "macos")]
-            {
-                // Stub renameat2 with ENOSYS on Mac
-                *libc::__error() = libc::ENOSYS;
-                -1
-            }
-        };
+        let old_file = old_inode.get_file()?;
+        let new_file = new_inode.get_file()?;
 
-        if res == 0 {
+        #[cfg(target_os = "linux")]
+        {
+            let res = unsafe {
+                libc::renameat2(
+                    old_file.as_raw_fd(),
+                    oldname.as_ptr(),
+                    new_file.as_raw_fd(),
+                    newname.as_ptr(),
+                    flags,
+                )
+            };
+            if res == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error().into())
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Linux uapi flag values used by FUSE wire protocol.
+            const RENAME_NOREPLACE: u32 = 1;
+            const RENAME_EXCHANGE: u32 = 2;
+            const RENAME_WHITEOUT: u32 = 4;
+
+            // Capture source (and dest, for EXCHANGE) ids before the rename so
+            // we can rewrite their cached lazy paths on success.
+            let lazy = self.cfg.macos_lazy_inode_fd;
+            let src_id_before = if lazy {
+                statx::statx(&old_file, Some(oldname))
+                    .ok()
+                    .map(|s| inode_store::InodeId::from_stat(&s))
+            } else {
+                None
+            };
+            let dst_id_before = if lazy && flags == RENAME_EXCHANGE {
+                statx::statx(&new_file, Some(newname))
+                    .ok()
+                    .map(|s| inode_store::InodeId::from_stat(&s))
+            } else {
+                None
+            };
+
+            if flags == 0 {
+                let res = unsafe {
+                    libc::renameat(
+                        old_file.as_raw_fd(),
+                        oldname.as_ptr(),
+                        new_file.as_raw_fd(),
+                        newname.as_ptr(),
+                    )
+                };
+                if res != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                self.macos_lazy_after_rename(&new_inode, new_name, src_id_before)
+                    .await;
+                return Ok(());
+            }
+
+            // Map Linux flags to macOS `renamex_np` flags. Combinations and
+            // unsupported flags (e.g. WHITEOUT) return ENOTSUP — callers
+            // should handle the fallback themselves.
+            let macos_flags: libc::c_uint = match flags {
+                RENAME_NOREPLACE => libc::RENAME_EXCL,
+                RENAME_EXCHANGE => libc::RENAME_SWAP,
+                RENAME_WHITEOUT => {
+                    return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into());
+                }
+                _ => return Err(io::Error::from_raw_os_error(libc::ENOTSUP).into()),
+            };
+
+            // `renamex_np` only takes absolute paths — there is no `*at` form.
+            // Resolve dir fds to absolute paths via `F_GETPATH`, then join.
+            let old_dir = util::fd_path_cstr(old_file.as_raw_fd())?;
+            let new_dir = util::fd_path_cstr(new_file.as_raw_fd())?;
+            let old_full = join_dir_and_name(&old_dir, oldname)?;
+            let new_full = join_dir_and_name(&new_dir, newname)?;
+
+            let res = unsafe { libc::renamex_np(old_full.as_ptr(), new_full.as_ptr(), macos_flags) };
+            if res != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            // RENAME_EXCL: src moved to dest; same update as plain rename.
+            // RENAME_SWAP: src and dest swap places.
+            self.macos_lazy_after_rename(&new_inode, new_name, src_id_before)
+                .await;
+            if flags == RENAME_EXCHANGE {
+                self.macos_lazy_after_rename(&old_inode, name, dst_id_before)
+                    .await;
+            }
             Ok(())
-        } else {
-            Err(io::Error::last_os_error().into())
         }
     }
 
@@ -2404,13 +2605,13 @@ impl Filesystem for PassthroughFs {
             .try_into()
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
 
-        // SAFETY: copy_file_range reads from fd_in and writes to fd_out. We pass valid
-        // file descriptors and pointers to offset values. The syscall updates the offset
-        // pointers to reflect the new positions after the copy, but doesn't modify the
-        // file descriptor positions themselves (when offsets are non-NULL).
-        let res = unsafe {
-            #[cfg(target_os = "linux")]
-            {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: copy_file_range reads from fd_in and writes to fd_out. We pass valid
+            // file descriptors and pointers to offset values. The syscall updates the offset
+            // pointers to reflect the new positions after the copy, but doesn't modify the
+            // file descriptor positions themselves (when offsets are non-NULL).
+            let res = unsafe {
                 libc::copy_file_range(
                     _fd_in,
                     &mut _off_in as *mut i64,
@@ -2419,22 +2620,216 @@ impl Filesystem for PassthroughFs {
                     _len,
                     0,
                 )
+            };
+            if res < 0 {
+                Err(io::Error::last_os_error().into())
+            } else {
+                Ok(ReplyCopyFileRange {
+                    copied: res as usize as u64,
+                })
             }
-            #[cfg(target_os = "macos")]
-            {
-                *libc::__error() = libc::ENOSYS;
-                -1
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS has no copy_file_range. Two-tier strategy:
+            //
+            // 1. Whole-file copy (offset_in==offset_out==0, length>=src_size):
+            //    use `fcopyfile(.., COPYFILE_CLONE | COPYFILE_DATA)`. The
+            //    `CLONE` flag attempts an APFS O(1) clone; if the underlying
+            //    FS doesn't support cloning the kernel falls back to a data
+            //    copy (still in-kernel, faster than userspace pread/pwrite).
+            //
+            // 2. Partial / offset copy: pread+pwrite loop with a 64 KiB
+            //    buffer. Surfaces short copies the way Linux
+            //    copy_file_range does — a short return is success, fail only
+            //    if zero bytes moved.
+            if _off_in == 0 && _off_out == 0 {
+                let mut src_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                let st_res = unsafe { libc::fstat(_fd_in, src_st.as_mut_ptr()) };
+                if st_res == 0 {
+                    let src_size = unsafe { src_st.assume_init() }.st_size as u64;
+                    if src_size > 0 && length >= src_size {
+                        let copy_res = unsafe {
+                            libc::fcopyfile(
+                                _fd_in,
+                                _fd_out,
+                                std::ptr::null_mut(),
+                                libc::COPYFILE_CLONE | libc::COPYFILE_DATA,
+                            )
+                        };
+                        if copy_res == 0 {
+                            return Ok(ReplyCopyFileRange { copied: src_size });
+                        }
+                        // On any failure, drop through to the pread/pwrite
+                        // path so we never fail outright when a fallback exists.
+                    }
+                }
             }
+
+            const BUF_SIZE: usize = 64 * 1024;
+            let mut buf = vec![0u8; BUF_SIZE];
+            let mut copied: usize = 0;
+            while copied < _len {
+                let want = (_len - copied).min(BUF_SIZE);
+                let read_off = _off_in + copied as i64;
+                let n = unsafe {
+                    libc::pread(_fd_in, buf.as_mut_ptr() as *mut _, want, read_off)
+                };
+                if n < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return if copied == 0 {
+                        Err(err.into())
+                    } else {
+                        Ok(ReplyCopyFileRange { copied: copied as u64 })
+                    };
+                }
+                if n == 0 {
+                    break; // EOF on source
+                }
+                let n = n as usize;
+                let mut written = 0usize;
+                while written < n {
+                    let write_off = _off_out + (copied + written) as i64;
+                    let w = unsafe {
+                        libc::pwrite(
+                            _fd_out,
+                            buf.as_ptr().add(written) as *const _,
+                            n - written,
+                            write_off,
+                        )
+                    };
+                    if w < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return if copied + written == 0 {
+                            Err(err.into())
+                        } else {
+                            Ok(ReplyCopyFileRange {
+                                copied: (copied + written) as u64,
+                            })
+                        };
+                    }
+                    if w == 0 {
+                        break;
+                    }
+                    written += w as usize;
+                }
+                copied += written;
+                if written < n {
+                    break; // short write — stop here, return what we have
+                }
+            }
+            Ok(ReplyCopyFileRange { copied: copied as u64 })
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // macOS-only opcodes
+    // ------------------------------------------------------------------
+
+    /// macOS only: Finder-issued volume rename. Backing FS doesn't have a
+    /// notion of a volume name, so we accept and ignore. Returning an
+    /// error here would surface as `errno` in `setattrlist(ATTR_VOL_NAME)`
+    /// and confuse Finder.
+    #[cfg(target_os = "macos")]
+    async fn setvolname(&self, _req: Request, _name: &OsStr) -> Result<()> {
+        Ok(())
+    }
+
+    /// macOS only: HFS+/APFS extra-time query. macOS extends `stat(2)` with
+    /// backup-time and creation-time fields that aren't part of POSIX. The
+    /// kernel issues this opcode through `getattrlist(ATTR_CMN_BKUPTIME)`
+    /// and similar.
+    ///
+    /// We expose `st_birthtimespec` (creation time) for both fields. macOS
+    /// has no native concept of backup time on either HFS+ or APFS — the
+    /// field exists for `getattrlist` API compatibility but is not
+    /// updated by the kernel. Returning crtime is the best honest
+    /// approximation: it's monotonic, present on every inode, and fits
+    /// the field's semantic role (oldest meaningful timestamp on the
+    /// inode).
+    #[cfg(target_os = "macos")]
+    async fn getxtimes(
+        &self,
+        _req: Request,
+        inode: Inode,
+    ) -> Result<rfuse3::raw::reply::ReplyXTimes> {
+        let data = self.inode_map.get(inode).await?;
+        let st = data.handle.stat()?;
+        // libc::stat on macOS exposes st_birthtimespec.
+        let crtime =
+            rfuse3::Timestamp::new(st.st_birthtime as i64, st.st_birthtime_nsec as u32);
+        Ok(rfuse3::raw::reply::ReplyXTimes {
+            bkuptime: crtime,
+            crtime,
+        })
+    }
+
+    /// macOS only: atomic two-entry swap. Userspace triggers this through
+    /// `exchangedata(2)`. Implemented on top of `renamex_np(RENAME_SWAP)`,
+    /// which is the same primitive `rename2(RENAME_EXCHANGE)` already
+    /// uses — both the swap semantics and lazy-fd path bookkeeping are
+    /// identical.
+    #[cfg(target_os = "macos")]
+    async fn exchange(
+        &self,
+        _req: Request,
+        olddir: Inode,
+        oldname: &OsStr,
+        newdir: Inode,
+        newname: &OsStr,
+        _options: u64,
+    ) -> Result<()> {
+        let old_cstr = osstr_to_cstr(oldname).unwrap();
+        let old_cstr = old_cstr.as_ref();
+        let new_cstr = osstr_to_cstr(newname).unwrap();
+        let new_cstr = new_cstr.as_ref();
+        self.validate_path_component(old_cstr)?;
+        self.validate_path_component(new_cstr)?;
+
+        let old_inode = self.inode_map.get(olddir).await?;
+        let new_inode = self.inode_map.get(newdir).await?;
+        let old_file = old_inode.get_file()?;
+        let new_file = new_inode.get_file()?;
+
+        let lazy = self.cfg.macos_lazy_inode_fd;
+        let src_id_before = if lazy {
+            statx::statx(&old_file, Some(old_cstr))
+                .ok()
+                .map(|s| inode_store::InodeId::from_stat(&s))
+        } else {
+            None
+        };
+        let dst_id_before = if lazy {
+            statx::statx(&new_file, Some(new_cstr))
+                .ok()
+                .map(|s| inode_store::InodeId::from_stat(&s))
+        } else {
+            None
         };
 
-        if res < 0 {
-            Err(io::Error::last_os_error().into())
-        } else {
-            // res is guaranteed >= 0 here, safe to cast to usize then u64
-            Ok(ReplyCopyFileRange {
-                copied: res as usize as u64,
-            })
+        let old_dir_path = util::fd_path_cstr(old_file.as_raw_fd())?;
+        let new_dir_path = util::fd_path_cstr(new_file.as_raw_fd())?;
+        let old_full = join_dir_and_name(&old_dir_path, old_cstr)?;
+        let new_full = join_dir_and_name(&new_dir_path, new_cstr)?;
+
+        let res =
+            unsafe { libc::renamex_np(old_full.as_ptr(), new_full.as_ptr(), libc::RENAME_SWAP) };
+        if res != 0 {
+            return Err(io::Error::last_os_error().into());
         }
+
+        // After SWAP: each entry now lives at the other's old path.
+        self.macos_lazy_after_rename(&new_inode, newname, src_id_before)
+            .await;
+        self.macos_lazy_after_rename(&old_inode, oldname, dst_id_before)
+            .await;
+        Ok(())
     }
 }
 
