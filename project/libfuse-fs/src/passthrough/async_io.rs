@@ -545,8 +545,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let file = data.get_file()?;
         #[cfg(target_os = "linux")]
         let st = statx(&file, Some(name)).ok();
-        #[cfg(target_os = "macos")]
-        let _ = name; // st only used by Linux below; suppress unused-let warning
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::unlinkat(file.as_raw_fd(), name.as_ptr(), flags) };
         if res == 0 {

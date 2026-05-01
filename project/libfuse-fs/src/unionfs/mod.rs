@@ -36,7 +36,7 @@ use futures::stream::iter;
 
 use crate::passthrough::{PassthroughArgs, new_passthroughfs_layer};
 use crate::util::convert_stat64_to_file_attr;
-use crate::util::whiteout::{WhiteoutFormat, oci_whiteout_name};
+use crate::util::whiteout::{WhiteoutFormat, is_user_creatable_name, oci_whiteout_name};
 use inode_store::InodeStore;
 use layer::Layer;
 use rfuse3::raw::logfs::LoggingFileSystem;
@@ -239,12 +239,11 @@ impl RealInode {
                         WhiteoutFormat::OciWhiteout => {
                             let wh_name = oci_whiteout_name(OsStr::new(name));
                             match layer.lookup(ctx, self.inode, &wh_name).await {
-                                Ok(marker) => {
-                                    if marker.attr.ino != 0 {
-                                        layer.forget(ctx, marker.attr.ino, 1).await;
-                                    }
+                                Ok(marker) if marker.attr.ino != 0 => {
+                                    layer.forget(ctx, marker.attr.ino, 1).await;
                                     true
                                 }
+                                Ok(_) => false,
                                 Err(e) => {
                                     let ie: std::io::Error = e.into();
                                     if ie.raw_os_error() == Some(libc::ENOENT) {
@@ -335,7 +334,10 @@ impl RealInode {
         let a_map = child_names.entries.map(|entery| async {
             match entery {
                 Ok(dire) => {
-                    let dname = dire.name.into_string().unwrap();
+                    let dname = dire
+                        .name
+                        .into_string()
+                        .map_err(|_| Errno::from(libc::EINVAL))?;
                     if dname == "." || dname == ".." {
                         return Ok(());
                     }
@@ -380,8 +382,9 @@ impl RealInode {
                 Err(err) => Err(err),
             }
         });
-        let k = join_all(a_map.collect::<Vec<_>>().await).await;
-        drop(k);
+        for result in join_all(a_map.collect::<Vec<_>>().await).await {
+            result?;
+        }
         // Now into_inner func is safety.
         let re = Arc::try_unwrap(child_real_inodes)
             .map_err(|_| Errno::new_not_exist())?
@@ -1075,6 +1078,19 @@ impl OverlayFs {
         self.inodes.write().await.alloc_inode(path)
     }
 
+    fn check_user_creatable_name(&self, name: &OsStr) -> Result<()> {
+        let format = self
+            .upper_layer
+            .as_ref()
+            .map(|layer| layer.whiteout_format())
+            .unwrap_or_default();
+        if is_user_creatable_name(format, name) {
+            Ok(())
+        } else {
+            Err(Error::from_raw_os_error(libc::EINVAL))
+        }
+    }
+
     /// Add a file layer and stack and merge the previous file layers.
     pub async fn push_layer(&mut self, layer: Arc<BoxedLayer>) -> Result<()> {
         let upper = self.upper_layer.take();
@@ -1568,6 +1584,7 @@ impl OverlayFs {
         if parent_node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
+        self.check_user_creatable_name(OsStr::new(name))?;
 
         let mut delete_whiteout = false;
         let mut set_opaque = false;
@@ -1655,6 +1672,7 @@ impl OverlayFs {
         if parent_node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
+        self.check_user_creatable_name(OsStr::new(name))?;
 
         match self
             .lookup_node_ignore_enoent(ctx, parent_node.inode, name)
@@ -1763,6 +1781,7 @@ impl OverlayFs {
         if parent_node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
+        self.check_user_creatable_name(name)?;
 
         let handle: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let real_ino: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
@@ -1896,6 +1915,7 @@ impl OverlayFs {
         let new_name_str = new_name
             .to_str()
             .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
+        self.check_user_creatable_name(new_name)?;
 
         let parent_node = self.lookup_node(req, parent, "").await?;
         let new_parent_node = self.lookup_node(req, new_parent, "").await?;
@@ -1977,6 +1997,7 @@ impl OverlayFs {
         {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
+        self.check_user_creatable_name(OsStr::new(name))?;
 
         let st = src_node.stat64(ctx).await?;
         if utils::is_dir(&st.attr.kind) {
@@ -2054,6 +2075,7 @@ impl OverlayFs {
         if parent_node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
+        self.check_user_creatable_name(name_os)?;
 
         match self
             .lookup_node_ignore_enoent(ctx, parent_node.inode, name)

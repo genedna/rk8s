@@ -168,10 +168,12 @@ pub trait Layer: Filesystem {
             let marker = OsStr::new(OCI_OPAQUE_MARKER);
             return match self.lookup(ctx, ino, marker).await {
                 Ok(v) => {
-                    if v.attr.ino != 0 {
+                    if v.attr.ino == 0 {
+                        Ok(false)
+                    } else {
                         self.forget(ctx, v.attr.ino, 1).await;
+                        Ok(true)
                     }
-                    Ok(true)
                 }
                 Err(e) => {
                     let ie: std::io::Error = e.into();
@@ -282,8 +284,15 @@ async fn oci_create_marker<F: Filesystem + ?Sized>(
     parent: Inode,
     marker: &OsStr,
 ) -> Result<ReplyEntry> {
-    if let Ok(v) = fs.lookup(ctx, parent, marker).await {
-        return Ok(v);
+    match fs.lookup(ctx, parent, marker).await {
+        Ok(v) if v.attr.ino != 0 => return Ok(v),
+        Ok(_) => {}
+        Err(e) => {
+            let ie: std::io::Error = e.into();
+            if ie.raw_os_error() != Some(libc::ENOENT) {
+                return Err(ie.into());
+            }
+        }
     }
     let flags = (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as u32;
     let created = fs.create(ctx, parent, marker, 0o000, flags).await?;
