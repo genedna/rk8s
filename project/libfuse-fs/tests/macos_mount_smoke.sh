@@ -3,6 +3,10 @@
 #
 # This is intentionally opt-in. It needs a working macFUSE installation and a
 # runner where the kernel extension/system extension can be loaded.
+#
+# Optional env:
+#   MACFUSE_SMOKE_REQUIRED=0  Skip instead of fail when the mount does not
+#                             come up. Use only for advisory GitHub-hosted CI.
 
 set -euo pipefail
 
@@ -16,11 +20,23 @@ fail() {
     exit 1
 }
 
+smoke_required() {
+    [[ "${MACFUSE_SMOKE_REQUIRED:-1}" != "0" ]]
+}
+
+skip_or_fail() {
+    if smoke_required; then
+        fail "$*"
+    else
+        skip "$*"
+    fi
+}
+
 [[ "$(uname -s)" == "Darwin" ]] || skip "not on macOS"
 [[ "${RUN_MACFUSE_TESTS:-0}" == "1" ]] || skip "RUN_MACFUSE_TESTS!=1"
 
 MACFUSE_BIN="/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
-[[ -x "$MACFUSE_BIN" ]] || skip "macFUSE not installed"
+[[ -x "$MACFUSE_BIN" ]] || skip_or_fail "macFUSE not installed"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -36,8 +52,10 @@ resolve_target_dir() {
 }
 
 TARGET_DIR="$(resolve_target_dir)"
+PASSTHROUGH_BIN_FROM_ENV="${PASSTHROUGH_BIN:-}"
 PASSTHROUGH_BIN="${PASSTHROUGH_BIN:-$TARGET_DIR/debug/examples/passthrough}"
 if [[ ! -x "$PASSTHROUGH_BIN" ]]; then
+    [[ -z "$PASSTHROUGH_BIN_FROM_ENV" ]] || fail "PASSTHROUGH_BIN is not executable: $PASSTHROUGH_BIN"
     echo "Building passthrough example..." >&2
     (cd "$REPO_ROOT" && cargo build --example passthrough)
 fi
@@ -163,7 +181,9 @@ run_one_loop() {
     "$PASSTHROUGH_BIN" --mountpoint "$MOUNT_POINT" --rootdir "$ROOT_DIR" &
     PASSTHROUGH_PID=$!
 
-    wait_for_mount || fail "mount did not come up"
+    if ! wait_for_mount; then
+        skip_or_fail "mount did not come up; macFUSE is installed but not loadable on this runner"
+    fi
 
     test "$(cat "$MOUNT_POINT/marker.txt")" = "hello-from-smoke"
     echo "smoke-write" > "$MOUNT_POINT/written.txt"

@@ -123,6 +123,7 @@ jobs:
         working-directory: project/libfuse-fs
         env:
           KEEP_MOUNT: "0"
+          MACFUSE_SMOKE_REQUIRED: "0"
           MOUNT_POINT: ${{ runner.temp }}/libfusefs-smoke-mnt
           ROOT_DIR: ${{ runner.temp }}/libfusefs-smoke-root
           RUN_MACFUSE_TESTS: "1"
