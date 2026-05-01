@@ -7,9 +7,7 @@ use std::ffi::OsStr;
 use std::io::Error;
 
 use crate::passthrough::PassthroughFs;
-use crate::util::whiteout::{
-    OCI_OPAQUE_MARKER, WhiteoutFormat, oci_whiteout_name,
-};
+use crate::util::whiteout::{OCI_OPAQUE_MARKER, WhiteoutFormat, oci_whiteout_name};
 pub const OPAQUE_XATTR_LEN: u32 = 16;
 pub const OPAQUE_XATTR: &str = "user.fuseoverlayfs.opaque";
 pub const UNPRIVILEGED_OPAQUE_XATTR: &str = "user.overlay.opaque";
@@ -79,7 +77,9 @@ pub trait Layer: Filesystem {
                 #[allow(clippy::unnecessary_cast)]
                 self.mknod(ctx, ino, name, mode as u32, dev as u32).await
             }
-            WhiteoutFormat::OciWhiteout => oci_create_marker(self, ctx, ino, &oci_whiteout_name(name)).await,
+            WhiteoutFormat::OciWhiteout => {
+                oci_create_marker(self, ctx, ino, &oci_whiteout_name(name)).await
+            }
         }
     }
 

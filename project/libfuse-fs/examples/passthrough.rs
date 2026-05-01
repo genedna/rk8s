@@ -98,12 +98,10 @@ async fn main() {
         cfg.dir_entry_timeout = Some(Duration::ZERO);
         cfg.dir_attr_timeout = Some(Duration::ZERO);
         if let Some(m) = args.options.as_deref() {
-            cfg.mapping = m
-                .parse()
-                .unwrap_or_else(|e| {
-                    error!("invalid mapping {m}: {e}; using empty mapping");
-                    Default::default()
-                });
+            cfg.mapping = m.parse().unwrap_or_else(|e| {
+                error!("invalid mapping {m}: {e}; using empty mapping");
+                Default::default()
+            });
         }
         let fs = PassthroughFs::<()>::new(cfg).expect("Failed to init passthrough fs (eager)");
         fs.import().await.expect("Failed to import root inode");

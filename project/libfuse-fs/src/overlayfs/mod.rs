@@ -248,7 +248,7 @@ impl RealInode {
                                     if ie.raw_os_error() == Some(libc::ENOENT) {
                                         false
                                     } else {
-                                        return Err(ie.into());
+                                        return Err(ie);
                                     }
                                 }
                             }
@@ -328,8 +328,7 @@ impl RealInode {
 
         // Lookup all child and construct "RealInode"s.
         let child_real_inodes = Arc::new(Mutex::new(HashMap::new()));
-        let oci_mode =
-            matches!(self.layer.whiteout_format(), WhiteoutFormat::OciWhiteout);
+        let oci_mode = matches!(self.layer.whiteout_format(), WhiteoutFormat::OciWhiteout);
         let a_map = child_names.entries.map(|entery| async {
             match entery {
                 Ok(dire) => {
@@ -339,9 +338,8 @@ impl RealInode {
                     }
                     if oci_mode {
                         // Opaque-dir marker: bookkeeping only, never surfaced.
-                        if crate::util::whiteout::is_oci_opaque_marker(
-                            std::ffi::OsStr::new(&dname),
-                        ) {
+                        if crate::util::whiteout::is_oci_opaque_marker(std::ffi::OsStr::new(&dname))
+                        {
                             return Ok(());
                         }
                         // .wh.<base> marker: hide the marker name itself, but
@@ -350,9 +348,7 @@ impl RealInode {
                         // entry (otherwise lower's `<base>` would leak through
                         // any time the upper layer is re-scanned from disk).
                         if let Some(base) =
-                            crate::util::whiteout::oci_whiteout_target(
-                                std::ffi::OsStr::new(&dname),
-                            )
+                            crate::util::whiteout::oci_whiteout_target(std::ffi::OsStr::new(&dname))
                         {
                             let base_str = base.to_string_lossy().into_owned();
                             // Look up the marker so we have its inode (needed
@@ -377,8 +373,7 @@ impl RealInode {
                         }
                         // Unknown ".wh.*" form (defensive): skip rather than
                         // surface — same conservative choice as before.
-                        if dname.starts_with(crate::util::whiteout::OCI_WHITEOUT_PREFIX)
-                        {
+                        if dname.starts_with(crate::util::whiteout::OCI_WHITEOUT_PREFIX) {
                             return Ok(());
                         }
                     }
@@ -2295,8 +2290,7 @@ impl OverlayFs {
                 // EEXIST is unexpected here (caller path is "no upper exists
                 // yet"). Surface real errors instead of silently falling
                 // through, so we don't mask data-loss bugs.
-                if e.raw_os_error() != Some(libc::ENOTSUP)
-                    && e.raw_os_error() != Some(libc::EXDEV)
+                if e.raw_os_error() != Some(libc::ENOTSUP) && e.raw_os_error() != Some(libc::EXDEV)
                 {
                     return Err(e);
                 }
@@ -2308,7 +2302,11 @@ impl OverlayFs {
         // RealInode tracks the new entry and node.add_upper_inode wires it
         // into the OverlayInode tree.
         let entry = upper_layer
-            .lookup(Request::default(), upper_parent_inode, OsStr::new(&name_owned))
+            .lookup(
+                Request::default(),
+                upper_parent_inode,
+                OsStr::new(&name_owned),
+            )
             .await?;
         let real = RealInode {
             layer: upper_layer,

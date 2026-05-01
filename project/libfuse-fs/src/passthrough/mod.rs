@@ -27,9 +27,11 @@ use std::path::Path;
 use tracing::error;
 use tracing::{debug, warn};
 
-use std::sync::atomic::{AtomicBool, AtomicU32};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroUsize;
+#[cfg(target_os = "macos")]
+use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::{
     collections::{BTreeMap, btree_map},
     ffi::{CStr, CString, OsString},
@@ -46,8 +48,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-#[cfg(target_os = "macos")]
-use std::sync::Weak;
 use util::{
     UniqueInodeGenerator, ebadf, is_dir, openat, reopen_fd_through_proc, stat_fd,
     validate_path_component,
@@ -323,10 +323,10 @@ impl LazyFdLru {
             // they're independent, but releasing eagerly keeps the LRU
             // critical section as small as possible.
             drop(guard);
-            if let Some(state) = evicted_weak.upgrade() {
-                if let Ok(mut s) = state.lock() {
-                    s.cached = None;
-                }
+            if let Some(state) = evicted_weak.upgrade()
+                && let Ok(mut s) = state.lock()
+            {
+                s.cached = None;
             }
         }
     }
@@ -612,17 +612,15 @@ impl InodeData {
                 let guard = state.lock().expect("ReopenableState mutex");
                 (guard.cached.is_some(), guard.lazy_fd_lru.clone())
             };
-            if had_cache {
-                if let Some(lru) = lru_opt {
-                    // Open with non-RDONLY flags doesn't populate the cache,
-                    // so we only `bump_reopen` for the path that actually
-                    // refreshed cache. Touch is unconditional once we know
-                    // the cache is populated — promotes in LRU.
-                    if flags == libc::O_RDONLY {
-                        lru.bump_reopen();
-                    }
-                    lru.touch(self.inode, Arc::downgrade(state));
+            if had_cache && let Some(lru) = lru_opt {
+                // Open with non-RDONLY flags doesn't populate the cache,
+                // so we only `bump_reopen` for the path that actually
+                // refreshed cache. Touch is unconditional once we know
+                // the cache is populated — promotes in LRU.
+                if flags == libc::O_RDONLY {
+                    lru.bump_reopen();
                 }
+                lru.touch(self.inode, Arc::downgrade(state));
             }
         }
         Ok(f)
@@ -713,9 +711,7 @@ impl InodeMap {
         // Linux: try the by-handle lookup first to detect inode-ID reuse.
         // macOS: file handles don't exist, so by-id is the only key.
         #[cfg(target_os = "linux")]
-        let by_handle = handle
-            .file_handle()
-            .and_then(|h| inodes.get_by_handle(h));
+        let by_handle = handle.file_handle().and_then(|h| inodes.get_by_handle(h));
         #[cfg(target_os = "macos")]
         let by_handle: Option<&Arc<InodeData>> = None;
 
@@ -1236,20 +1232,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // `Reopenable` handle that opens lazily on first I/O. This is the
         // mechanism that lets entry/attr cache TTLs go above zero on macOS.
         #[cfg(target_os = "macos")]
-        if self.cfg.macos_lazy_inode_fd {
-            if let Some(abs_path) = lazy_abs_path {
-                let st = statx::statx(dir, Some(name))?;
-                return Ok((
-                    InodeHandle::Reopenable {
-                        state: Arc::new(StdMutex::new(ReopenableState {
-                            path: abs_path,
-                            cached: None,
-                            lazy_fd_lru: self.lazy_fd_lru.clone(),
-                        })),
-                    },
-                    st,
-                ));
-            }
+        if self.cfg.macos_lazy_inode_fd
+            && let Some(abs_path) = lazy_abs_path
+        {
+            let st = statx::statx(dir, Some(name))?;
+            return Ok((
+                InodeHandle::Reopenable {
+                    state: Arc::new(StdMutex::new(ReopenableState {
+                        path: abs_path,
+                        cached: None,
+                        lazy_fd_lru: self.lazy_fd_lru.clone(),
+                    })),
+                },
+                st,
+            ));
         }
 
         #[cfg(target_os = "linux")]
@@ -1952,8 +1948,10 @@ mod tests {
         let mount_path = OsString::from(mount_dir.as_os_str());
 
         let session = Session::new(mount_options);
-        let mount_handle =
-            unwrap_or_skip_mount_error!(session.mount(fs, mount_path).await, "mount passthrough fs");
+        let mount_handle = unwrap_or_skip_mount_error!(
+            session.mount(fs, mount_path).await,
+            "mount passthrough fs"
+        );
 
         // Immediately unmount to verify we at least mounted successfully.
         let _ = mount_handle.unmount().await; // errors ignored
@@ -1973,11 +1971,7 @@ mod tests {
         .unwrap();
 
         let err = fs
-            .lookup(
-                Request::default(),
-                ROOT_ID,
-                OsStr::from_bytes(b"bad\0name"),
-            )
+            .lookup(Request::default(), ROOT_ID, OsStr::from_bytes(b"bad\0name"))
             .await
             .unwrap_err();
         let ioerr = std::io::Error::from(err);
@@ -2022,7 +2016,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let name = CStr::from_bytes_with_nul(b"link.txt\0").unwrap();
+        let name = c"link.txt";
 
         let entry = fs.do_lookup(ROOT_ID, name).await.unwrap();
 
@@ -2047,18 +2041,15 @@ mod tests {
         symlink("file.txt", temp.path().join("link.txt")).unwrap();
 
         // Regular file: O_NOFOLLOW path returns the fd.
-        let file_c =
-            CString::new(temp.path().join("file.txt").as_os_str().as_bytes()).unwrap();
+        let file_c = CString::new(temp.path().join("file.txt").as_os_str().as_bytes()).unwrap();
         let fd = super::lazy_open_path(&file_c, libc::O_RDONLY).expect("regular open failed");
         assert!(fd >= 0);
         unsafe { libc::close(fd) };
 
         // Trailing-symlink: ELOOP on first try → O_SYMLINK retry returns
         // an fd to the link itself.
-        let link_c =
-            CString::new(temp.path().join("link.txt").as_os_str().as_bytes()).unwrap();
-        let fd = super::lazy_open_path(&link_c, libc::O_RDONLY)
-            .expect("symlink retry path failed");
+        let link_c = CString::new(temp.path().join("link.txt").as_os_str().as_bytes()).unwrap();
+        let fd = super::lazy_open_path(&link_c, libc::O_RDONLY).expect("symlink retry path failed");
         assert!(fd >= 0);
         unsafe { libc::close(fd) };
     }
@@ -2089,28 +2080,22 @@ mod tests {
         fs.import().await.unwrap();
 
         // Walk the tree to populate cached `lazy_path` on every node.
-        let a_entry = fs
-            .do_lookup(ROOT_ID, CStr::from_bytes_with_nul(b"a\0").unwrap())
-            .await
-            .unwrap();
-        let sub_entry = fs
-            .do_lookup(a_entry.attr.ino, CStr::from_bytes_with_nul(b"sub\0").unwrap())
-            .await
-            .unwrap();
-        let file_entry = fs
-            .do_lookup(
-                sub_entry.attr.ino,
-                CStr::from_bytes_with_nul(b"file.txt\0").unwrap(),
-            )
-            .await
-            .unwrap();
+        let a_entry = fs.do_lookup(ROOT_ID, c"a").await.unwrap();
+        let sub_entry = fs.do_lookup(a_entry.attr.ino, c"sub").await.unwrap();
+        let file_entry = fs.do_lookup(sub_entry.attr.ino, c"file.txt").await.unwrap();
 
         // Drive the FUSE rename trait directly — it issues the underlying
         // `renameat(2)` and runs the lazy-path descendant walk.
         use rfuse3::raw::Filesystem;
-        fs.rename(Request::default(), ROOT_ID, OsStr::new("a"), ROOT_ID, OsStr::new("b"))
-            .await
-            .unwrap();
+        fs.rename(
+            Request::default(),
+            ROOT_ID,
+            OsStr::new("a"),
+            ROOT_ID,
+            OsStr::new("b"),
+        )
+        .await
+        .unwrap();
 
         // Every descendant must now resolve under "/…/b/sub/...".
         let new_root = temp_dir.path().canonicalize().unwrap();
@@ -2313,8 +2298,13 @@ mod tests {
         })
         .await
         .unwrap();
-        let res = fs.setvolname(Request::default(), OsStr::new("MyVolume")).await;
-        assert!(res.is_ok(), "setvolname must not return ENOSYS, got {res:?}");
+        let res = fs
+            .setvolname(Request::default(), OsStr::new("MyVolume"))
+            .await;
+        assert!(
+            res.is_ok(),
+            "setvolname must not return ENOSYS, got {res:?}"
+        );
     }
 
     /// `getxtimes` returns `st_birthtimespec` for both fields. Test creates
@@ -2335,7 +2325,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let cname = CStr::from_bytes_with_nul(b"birthcheck.txt\0").unwrap();
+        let cname = c"birthcheck.txt";
         let entry = fs.do_lookup(ROOT_ID, cname).await.unwrap();
         let times = fs
             .getxtimes(Request::default(), entry.attr.ino)
@@ -2386,8 +2376,14 @@ mod tests {
         // After RENAME_SWAP: a.txt now holds B_PAYLOAD; b.txt holds A_PAYLOAD.
         let after_a = std::fs::read(temp_dir.path().join("a.txt")).unwrap();
         let after_b = std::fs::read(temp_dir.path().join("b.txt")).unwrap();
-        assert_eq!(after_a, b"B_PAYLOAD", "exchange did not move B's content to a.txt");
-        assert_eq!(after_b, b"A_PAYLOAD", "exchange did not move A's content to b.txt");
+        assert_eq!(
+            after_a, b"B_PAYLOAD",
+            "exchange did not move B's content to a.txt"
+        );
+        assert_eq!(
+            after_b, b"A_PAYLOAD",
+            "exchange did not move A's content to b.txt"
+        );
     }
 
     /// Resource fork xattrs are the one macOS xattr namespace where the
@@ -2408,10 +2404,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let entry = fs
-            .do_lookup(ROOT_ID, CStr::from_bytes_with_nul(b"forked.txt\0").unwrap())
-            .await
-            .unwrap();
+        let entry = fs.do_lookup(ROOT_ID, c"forked.txt").await.unwrap();
         let attr = OsStr::new("com.apple.ResourceFork");
 
         fs.setxattr(Request::default(), entry.attr.ino, attr, b"abcd", 0, 0)

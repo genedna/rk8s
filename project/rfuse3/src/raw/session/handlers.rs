@@ -15,12 +15,12 @@ use tracing::{debug, debug_span, error};
 use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
-use crate::raw::filesystem::Filesystem;
-use crate::raw::reply::ReplyXAttr;
 #[cfg(target_os = "macos")]
 use crate::raw::abi::{
     fuse_exchange_in, fuse_getxtimes_out, FUSE_EXCHANGE_IN_SIZE, FUSE_GETXTIMES_OUT_SIZE,
 };
+use crate::raw::filesystem::Filesystem;
+use crate::raw::reply::ReplyXAttr;
 use crate::raw::request::Request;
 use crate::SetAttr;
 
@@ -2535,8 +2535,7 @@ pub(super) async fn worker_getxtimes<FS: Filesystem + Send + Sync + 'static>(
                     error: 0,
                     unique: item.unique,
                 };
-                let mut data =
-                    Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_GETXTIMES_OUT_SIZE);
+                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_GETXTIMES_OUT_SIZE);
                 get_bincode_config()
                     .serialize_into(&mut data, &out_header)
                     .expect("serialize header");

@@ -250,7 +250,7 @@ impl RealInode {
                                     if ie.raw_os_error() == Some(libc::ENOENT) {
                                         false
                                     } else {
-                                        return Err(ie.into());
+                                        return Err(ie);
                                     }
                                 }
                             }
@@ -331,8 +331,7 @@ impl RealInode {
         // Lookup all child and construct "RealInode"s.
         let child_real_inodes = Arc::new(Mutex::new(HashMap::new()));
         // trace!("readdir: before iter childrens");
-        let oci_mode =
-            matches!(self.layer.whiteout_format(), WhiteoutFormat::OciWhiteout);
+        let oci_mode = matches!(self.layer.whiteout_format(), WhiteoutFormat::OciWhiteout);
         let a_map = child_names.entries.map(|entery| async {
             match entery {
                 Ok(dire) => {
@@ -341,17 +340,14 @@ impl RealInode {
                         return Ok(());
                     }
                     if oci_mode {
-                        if crate::util::whiteout::is_oci_opaque_marker(
-                            std::ffi::OsStr::new(&dname),
-                        ) {
+                        if crate::util::whiteout::is_oci_opaque_marker(std::ffi::OsStr::new(&dname))
+                        {
                             return Ok(());
                         }
                         // Translate `.wh.<base>` into a whiteout entry under
                         // `<base>` so union merge drops lower-layer matches.
                         if let Some(base) =
-                            crate::util::whiteout::oci_whiteout_target(
-                                std::ffi::OsStr::new(&dname),
-                            )
+                            crate::util::whiteout::oci_whiteout_target(std::ffi::OsStr::new(&dname))
                         {
                             let base_str = base.to_string_lossy().into_owned();
                             let marker = self
@@ -372,8 +368,7 @@ impl RealInode {
                             child_real_inodes.lock().await.insert(base_str, real);
                             return Ok(());
                         }
-                        if dname.starts_with(crate::util::whiteout::OCI_WHITEOUT_PREFIX)
-                        {
+                        if dname.starts_with(crate::util::whiteout::OCI_WHITEOUT_PREFIX) {
                             return Ok(());
                         }
                     }
@@ -2288,8 +2283,7 @@ impl OverlayFs {
             Ok(true) => {}
             Ok(false) => return Ok(None),
             Err(e) => {
-                if e.raw_os_error() != Some(libc::ENOTSUP)
-                    && e.raw_os_error() != Some(libc::EXDEV)
+                if e.raw_os_error() != Some(libc::ENOTSUP) && e.raw_os_error() != Some(libc::EXDEV)
                 {
                     return Err(e);
                 }
@@ -2298,7 +2292,11 @@ impl OverlayFs {
         }
 
         let entry = upper_layer
-            .lookup(Request::default(), upper_parent_inode, OsStr::new(&name_owned))
+            .lookup(
+                Request::default(),
+                upper_parent_inode,
+                OsStr::new(&name_owned),
+            )
             .await?;
         let real = RealInode {
             layer: upper_layer,

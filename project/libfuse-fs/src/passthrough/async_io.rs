@@ -21,20 +21,20 @@ use tracing::{debug, error, info, trace};
 
 use vm_memory::{ByteValued, bitmap::BitmapSlice};
 
+#[cfg(target_os = "linux")]
+use crate::passthrough::{FileUniqueKey, statx::statx};
 use crate::{
     passthrough::{CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR},
     util::{convert_stat64_to_file_attr, filetype_from_mode},
 };
-#[cfg(target_os = "linux")]
-use crate::passthrough::{FileUniqueKey, statx::statx};
 
 use super::ebadf;
+#[cfg(target_os = "linux")]
+use super::util::fd_path_cstr;
 use super::util::{
     self, AT_EMPTY_PATH, SLASH_ASCII, einval, enosys, is_safe_inode, osstr_to_cstr, set_creds,
     stat_fd, stat64,
 };
-#[cfg(target_os = "linux")]
-use super::util::fd_path_cstr;
 #[cfg(target_os = "macos")]
 use super::util::{is_linux_only_xattr, join_dir_and_name};
 use super::{Handle, HandleData, PassthroughFs, config::CachePolicy, os_compat::LinuxDirent64};
@@ -2415,7 +2415,8 @@ impl Filesystem for PassthroughFs {
             let old_full = join_dir_and_name(&old_dir, oldname)?;
             let new_full = join_dir_and_name(&new_dir, newname)?;
 
-            let res = unsafe { libc::renamex_np(old_full.as_ptr(), new_full.as_ptr(), macos_flags) };
+            let res =
+                unsafe { libc::renamex_np(old_full.as_ptr(), new_full.as_ptr(), macos_flags) };
             if res != 0 {
                 return Err(io::Error::last_os_error().into());
             }
@@ -2676,9 +2677,7 @@ impl Filesystem for PassthroughFs {
             while copied < _len {
                 let want = (_len - copied).min(BUF_SIZE);
                 let read_off = _off_in + copied as i64;
-                let n = unsafe {
-                    libc::pread(_fd_in, buf.as_mut_ptr() as *mut _, want, read_off)
-                };
+                let n = unsafe { libc::pread(_fd_in, buf.as_mut_ptr() as *mut _, want, read_off) };
                 if n < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() == io::ErrorKind::Interrupted {
@@ -2687,7 +2686,9 @@ impl Filesystem for PassthroughFs {
                     return if copied == 0 {
                         Err(err.into())
                     } else {
-                        Ok(ReplyCopyFileRange { copied: copied as u64 })
+                        Ok(ReplyCopyFileRange {
+                            copied: copied as u64,
+                        })
                     };
                 }
                 if n == 0 {
@@ -2728,7 +2729,9 @@ impl Filesystem for PassthroughFs {
                     break; // short write — stop here, return what we have
                 }
             }
-            Ok(ReplyCopyFileRange { copied: copied as u64 })
+            Ok(ReplyCopyFileRange {
+                copied: copied as u64,
+            })
         }
     }
 
@@ -2766,8 +2769,7 @@ impl Filesystem for PassthroughFs {
         let data = self.inode_map.get(inode).await?;
         let st = data.handle.stat()?;
         // libc::stat on macOS exposes st_birthtimespec.
-        let crtime =
-            rfuse3::Timestamp::new(st.st_birthtime as i64, st.st_birthtime_nsec as u32);
+        let crtime = rfuse3::Timestamp::new(st.st_birthtime as i64, st.st_birthtime_nsec as u32);
         Ok(rfuse3::raw::reply::ReplyXTimes {
             bkuptime: crtime,
             crtime,

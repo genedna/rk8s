@@ -81,10 +81,7 @@ pub mod test_utils {
                     let ioerr: std::io::Error = e.into();
                     if $crate::test_utils::is_skippable_mount_error(&ioerr) {
                         if $crate::test_utils::macfuse_tests_enabled() {
-                            panic!(
-                                "{} failed while RUN_MACFUSE_TESTS=1: {:?}",
-                                $ctx, ioerr
-                            );
+                            panic!("{} failed while RUN_MACFUSE_TESTS=1: {:?}", $ctx, ioerr);
                         } else {
                             eprintln!("skip (mount environment) {}: {:?}", $ctx, ioerr);
                             return;

@@ -729,10 +729,16 @@ mod tests {
         let dst_c = CString::new(dst.as_os_str().as_bytes()).unwrap();
 
         let cloned = try_apfs_clonefile(&src_c, &dst_c).expect("clone failed");
-        assert!(cloned, "macOS tempdir defaults to APFS — clone should succeed");
+        assert!(
+            cloned,
+            "macOS tempdir defaults to APFS — clone should succeed"
+        );
 
         let read_back = std::fs::read(&dst).unwrap();
-        assert_eq!(read_back, payload, "clone produced different bytes than source");
+        assert_eq!(
+            read_back, payload,
+            "clone produced different bytes than source"
+        );
 
         // Cloning into an existing path must surface EEXIST as Err — the
         // helper is not allowed to silently overwrite.

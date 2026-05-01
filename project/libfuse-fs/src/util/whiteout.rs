@@ -104,7 +104,10 @@ mod tests {
 
     #[test]
     fn target_extraction() {
-        assert_eq!(oci_whiteout_target(OsStr::new(".wh.foo")), Some(OsStr::new("foo")));
+        assert_eq!(
+            oci_whiteout_target(OsStr::new(".wh.foo")),
+            Some(OsStr::new("foo"))
+        );
         assert_eq!(oci_whiteout_target(OsStr::new("foo")), None);
         assert_eq!(oci_whiteout_target(OsStr::new(OCI_OPAQUE_MARKER)), None);
     }

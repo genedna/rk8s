@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
+use super::InodeHandle;
+#[cfg(target_os = "linux")]
 use super::file_handle::FileHandle;
 use super::statx::StatExt;
-#[cfg(target_os = "linux")]
-use super::InodeHandle;
 use super::{Inode, InodeData};
 
 #[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug, Hash)]
