@@ -189,7 +189,7 @@ pub struct Config {
     /// `OciWhiteout` on macOS (avoids the root requirement of `mknod` char dev).
     pub whiteout_format: WhiteoutFormat,
 
-    /// **Experimental — semantics not API-stable.**
+    /// **Experimental configuration knob — semantics not API-stable.**
     ///
     /// On macOS, store inode references as path components + lazily-opened
     /// fds (the `Reopenable` `InodeHandle` variant) instead of always-open
@@ -203,9 +203,7 @@ pub struct Config {
     /// semantics may change without notice. Production callers should
     /// not depend on the eager fallback long-term.
     ///
-    /// Default on macOS: `true` (set by `new_passthroughfs_layer`).
-    /// Default on `Config::default()`: `false` so the eager-mode tests
-    /// stay opt-in.
+    /// Default on macOS: `true`.
     #[cfg(target_os = "macos")]
     pub macos_lazy_inode_fd: bool,
 
@@ -244,7 +242,7 @@ impl Default for Config {
             mapping: IdMappings::default(),
             whiteout_format: WhiteoutFormat::default(),
             #[cfg(target_os = "macos")]
-            macos_lazy_inode_fd: false,
+            macos_lazy_inode_fd: true,
             #[cfg(target_os = "macos")]
             macos_lazy_fd_lru_max: None,
         }

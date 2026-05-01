@@ -89,6 +89,13 @@ use tokio::sync::{Mutex, MutexGuard, RwLock};
 const MIN_PASSTHROUGH_NOFILE_SOFT_LIMIT: u64 = 8192;
 const RESERVED_FILE_DESCRIPTORS: u64 = 64;
 
+#[cfg(target_os = "macos")]
+fn recover_std_mutex<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Debug, Clone)]
 pub struct PassthroughArgs<P, M>
 where
@@ -107,10 +114,6 @@ pub async fn new_passthroughfs_layer<P: AsRef<Path>, M: AsRef<str>>(
         // enable xattr
         xattr: true,
         do_import: true,
-        // On macOS, default to the lazy-fd path so we can keep TTLs at the
-        // crate default (5 s) without pinning a real fd per cached inode.
-        #[cfg(target_os = "macos")]
-        macos_lazy_inode_fd: true,
         ..Default::default()
     };
     #[cfg(target_os = "macos")]
@@ -317,15 +320,14 @@ impl LazyFdLru {
     /// evicted (key, value) when the cache was full — `put` evicts
     /// silently and gives us no chance to drop the cached fd.
     fn touch(&self, inode: Inode, weak: Weak<StdMutex<ReopenableState>>) {
-        let mut guard = self.inner.lock().expect("LazyFdLru mutex");
+        let mut guard = recover_std_mutex(&self.inner);
         if let Some((_evicted_inode, evicted_weak)) = guard.push(inode, weak) {
             // Drop the lock before walking back to the InodeData mutex —
             // they're independent, but releasing eagerly keeps the LRU
             // critical section as small as possible.
             drop(guard);
-            if let Some(state) = evicted_weak.upgrade()
-                && let Ok(mut s) = state.lock()
-            {
+            if let Some(state) = evicted_weak.upgrade() {
+                let mut s = recover_std_mutex(&state);
                 s.cached = None;
             }
         }
@@ -335,7 +337,7 @@ impl LazyFdLru {
     /// reaches zero). Idempotent — missing entries are a no-op. Does **not**
     /// touch `ReopenableState::cached`; the inode itself is going away.
     fn remove(&self, inode: Inode) {
-        let mut guard = self.inner.lock().expect("LazyFdLru mutex");
+        let mut guard = recover_std_mutex(&self.inner);
         let _ = guard.pop(&inode);
     }
 
@@ -346,15 +348,13 @@ impl LazyFdLru {
     }
 
     /// Snapshot of the configured cap. Used by tests / metrics surfacing.
-    #[allow(dead_code)]
     pub(crate) fn cap(&self) -> usize {
         self.cap.get()
     }
 
     /// Snapshot of the current cache occupancy. Bounded by `cap()`.
-    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
-        self.inner.lock().expect("LazyFdLru mutex").len()
+        recover_std_mutex(&self.inner).len()
     }
 
     fn bump_reopen(&self) {
@@ -400,10 +400,18 @@ impl InodeHandle {
             InodeHandle::Reopenable { .. } => {
                 // Programmer error: every Reopenable access must go via
                 // InodeData::get_file so we can drive the lazy-open path.
-                Err(io::Error::other(
+                #[cfg(debug_assertions)]
+                panic!(
                     "InodeHandle::get_file called on Reopenable; \
-                     use InodeData::get_file instead",
-                ))
+                     use InodeData::get_file instead"
+                );
+                #[cfg(not(debug_assertions))]
+                {
+                    Err(io::Error::other(
+                        "InodeHandle::get_file called on Reopenable; \
+                         use InodeData::get_file instead",
+                    ))
+                }
             }
         }
     }
@@ -419,7 +427,7 @@ impl InodeHandle {
                 // symlink-aware helper. `state.path` is absolute, so the
                 // dirfd is irrelevant. LRU bookkeeping happens one level up
                 // in `InodeData::open_file`, which knows the inode number.
-                let mut guard = state.lock().expect("ReopenableState mutex");
+                let mut guard = recover_std_mutex(state);
                 let path = CString::new(guard.path.as_os_str().as_bytes())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let fd = lazy_open_path(&path, flags)?;
@@ -468,12 +476,13 @@ impl InodeHandle {
             InodeHandle::Reopenable { state } => {
                 // Stat by path — no need to keep an fd around just for stat.
                 let path = {
-                    let guard = state.lock().expect("ReopenableState mutex");
+                    let guard = recover_std_mutex(state);
                     CString::new(guard.path.as_os_str().as_bytes())
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                 };
-                // AT_FDCWD with an absolute path; AT_SYMLINK_NOFOLLOW matches
-                // the rest of the passthrough's stat behavior.
+                // `guard.path` is absolute, so AT_FDCWD is only a required
+                // placeholder. AT_SYMLINK_NOFOLLOW matches the rest of the
+                // passthrough's stat behavior.
                 let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
                 let res = unsafe {
                     libc::fstatat(
@@ -528,6 +537,12 @@ pub struct InodeData {
 /// are realpath-resolved, then using `O_NOFOLLOW_ANY` standalone.
 /// Tracked as future work in `macos-support-matrix.md`.
 ///
+/// The `O_NOFOLLOW` -> `O_SYMLINK` retry is intentionally a compatibility
+/// fallback and has a narrow race if the entry is swapped between the two
+/// opens. `cfg.root_dir` is canonicalized before lazy mode is enabled, so the
+/// race is confined to entries under that root; removing it completely needs
+/// the future `O_NOFOLLOW_ANY` design above.
+///
 /// Always sets `O_CLOEXEC`. Returns the raw fd; the caller wraps it in `File`.
 #[cfg(target_os = "macos")]
 fn lazy_open_path(path: &CStr, flags: libc::c_int) -> io::Result<libc::c_int> {
@@ -575,7 +590,7 @@ impl InodeData {
             // Lazy-open path: lock state, ensure a cached `Arc<File>`, then
             // hand out a refcount bump as `InodeFile::Arc`. No `dup(2)` per
             // call — a single shared fd is reused while the inode is alive.
-            let mut guard = state.lock().expect("ReopenableState mutex");
+            let mut guard = recover_std_mutex(state);
             let mut touched_lru = None;
             if guard.cached.is_none() {
                 let path = CString::new(guard.path.as_os_str().as_bytes())
@@ -609,7 +624,7 @@ impl InodeData {
         #[cfg(target_os = "macos")]
         if let InodeHandle::Reopenable { state } = &self.handle {
             let (had_cache, lru_opt) = {
-                let guard = state.lock().expect("ReopenableState mutex");
+                let guard = recover_std_mutex(state);
                 (guard.cached.is_some(), guard.lazy_fd_lru.clone())
             };
             if had_cache && let Some(lru) = lru_opt {
@@ -637,7 +652,7 @@ impl InodeData {
     #[cfg(target_os = "macos")]
     fn update_lazy_path(&self, new_path: PathBuf) {
         if let InodeHandle::Reopenable { state } = &self.handle {
-            let mut guard = state.lock().expect("ReopenableState mutex");
+            let mut guard = recover_std_mutex(state);
             guard.path = new_path;
             guard.cached = None;
         }
@@ -648,9 +663,7 @@ impl InodeData {
     #[cfg(target_os = "macos")]
     fn lazy_path(&self) -> Option<PathBuf> {
         match &self.handle {
-            InodeHandle::Reopenable { state } => {
-                Some(state.lock().expect("ReopenableState mutex").path.clone())
-            }
+            InodeHandle::Reopenable { state } => Some(recover_std_mutex(state).path.clone()),
             _ => None,
         }
     }

@@ -94,19 +94,44 @@ pub trait Layer: Filesystem {
                             self.forget(ctx, v.attr.ino, 1).await;
                         }
                         if is_whiteout(&v.attr) {
-                            return self.unlink(ctx, ino, name).await;
+                            return match self.unlink(ctx, ino, name).await {
+                                Ok(()) => Ok(()),
+                                Err(e) => {
+                                    let ie: std::io::Error = e.into();
+                                    if ie.raw_os_error() == Some(libc::ENOENT) {
+                                        Ok(())
+                                    } else {
+                                        Err(ie.into())
+                                    }
+                                }
+                            };
                         }
                         if v.attr.ino != 0 {
                             return Err(Error::from_raw_os_error(libc::EINVAL).into());
                         }
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        let ie: std::io::Error = e.into();
+                        if ie.raw_os_error() != Some(libc::ENOENT) {
+                            return Err(ie.into());
+                        }
+                    }
                 }
                 Ok(())
             }
             WhiteoutFormat::OciWhiteout => {
                 let wh = oci_whiteout_name(name);
-                self.unlink(ctx, ino, &wh).await
+                match self.unlink(ctx, ino, &wh).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let ie: std::io::Error = e.into();
+                        if ie.raw_os_error() == Some(libc::ENOENT) {
+                            Ok(())
+                        } else {
+                            Err(ie.into())
+                        }
+                    }
+                }
             }
         }
     }
@@ -314,9 +339,28 @@ mod test {
 
     use crate::{
         overlayfs::layer::Layer,
-        passthrough::{PassthroughArgs, new_passthroughfs_layer},
+        passthrough::{PassthroughArgs, PassthroughFs, config::Config, new_passthroughfs_layer},
         unwrap_or_skip_eperm,
+        util::whiteout::WhiteoutFormat,
     };
+
+    #[tokio::test]
+    async fn delete_missing_whiteout_is_idempotent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        for format in [WhiteoutFormat::CharDev, WhiteoutFormat::OciWhiteout] {
+            let fs = PassthroughFs::<()>::new(Config {
+                root_dir: temp_dir.path().to_path_buf(),
+                do_import: true,
+                whiteout_format: format,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.init(Request::default()).await.unwrap();
+            fs.delete_whiteout(Request::default(), 1, OsStr::new("missing"))
+                .await
+                .unwrap();
+        }
+    }
 
     // Mark as ignored by default; run with: RUN_PRIVILEGED_TESTS=1 cargo test -- --ignored
     #[ignore]

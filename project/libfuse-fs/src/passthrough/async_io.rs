@@ -2197,6 +2197,12 @@ impl Filesystem for PassthroughFs {
             let st = stat_fd(&_fd, None)?;
             let current_size = st.st_size as libc::off_t;
             if target_size > current_size {
+                // A concurrent writer can extend the file between stat and
+                // F_PREALLOCATE. That may over-reserve blocks, but the kernel
+                // clamps allocation to the file and ftruncate below preserves
+                // the requested final size. Same shared-fd race exists for
+                // Linux fallocate; correctness does not depend on the
+                // preallocation length being exact.
                 let mut store = libc::fstore_t {
                     fst_flags: libc::F_ALLOCATEALL,
                     fst_posmode: libc::F_PEOFPOSMODE,
