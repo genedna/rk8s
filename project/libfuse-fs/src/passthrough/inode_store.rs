@@ -161,6 +161,7 @@ impl InodeStore {
     /// Borrow-iterate over all (inode, data) pairs currently in the store.
     /// Caller holds the surrounding map read or write lock; iteration order
     /// follows BTreeMap ordering (by inode number).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn iter(&self) -> impl Iterator<Item = (&Inode, &Arc<InodeData>)> {
         self.data.iter()
     }

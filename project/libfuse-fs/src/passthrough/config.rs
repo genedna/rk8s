@@ -1,6 +1,7 @@
 // Copyright (C) 2020-2022 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(target_os = "macos")]
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;

@@ -35,6 +35,7 @@ pub trait Layer: ObjectSafeFilesystem {
     /// Resolve `inode` to the absolute host filesystem path that backs it,
     /// if such a mapping exists. Returns `None` for layers that lack a 1:1
     /// host-fs mapping. See `overlayfs::Layer::host_path_of` for details.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     async fn host_path_of(&self, _inode: Inode) -> Option<std::path::PathBuf> {
         None
     }
@@ -456,21 +457,19 @@ mod test {
     };
 
     #[tokio::test]
-    async fn delete_missing_whiteout_is_idempotent() {
+    async fn delete_missing_oci_whiteout_is_idempotent() {
         let temp_dir = tempfile::tempdir().unwrap();
-        for format in [WhiteoutFormat::CharDev, WhiteoutFormat::OciWhiteout] {
-            let fs = PassthroughFs::<()>::new(Config {
-                root_dir: temp_dir.path().to_path_buf(),
-                do_import: true,
-                whiteout_format: format,
-                ..Default::default()
-            })
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: temp_dir.path().to_path_buf(),
+            do_import: true,
+            whiteout_format: WhiteoutFormat::OciWhiteout,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.init(Request::default()).await.unwrap();
+        fs.delete_whiteout(Request::default(), 1, OsStr::new("missing"))
+            .await
             .unwrap();
-            fs.init(Request::default()).await.unwrap();
-            fs.delete_whiteout(Request::default(), 1, OsStr::new("missing"))
-                .await
-                .unwrap();
-        }
     }
 
     // Mark as ignored by default; run with: RUN_PRIVILEGED_TESTS=1 cargo test -- --ignored

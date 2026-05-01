@@ -22,8 +22,12 @@ use statx::StatExt;
 use std::cmp;
 use std::io::Result;
 use std::ops::DerefMut;
+#[cfg(target_os = "macos")]
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex as StdMutex;
 use tracing::error;
 use tracing::{debug, warn};
 
@@ -39,12 +43,11 @@ use std::{
     io::{self, Error},
     marker::PhantomData,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
         unix::ffi::OsStringExt,
     },
     path::PathBuf,
     sync::Arc,
-    sync::Mutex as StdMutex,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -201,6 +204,7 @@ enum InodeFile<'a> {
     /// Avoids the per-call `dup(2)` syscall that `Owned` would require — we
     /// just bump the `Arc` refcount and let the caller borrow the underlying
     /// fd. Lifetime is `'static` because the `Arc` itself owns the `File`.
+    #[cfg(target_os = "macos")]
     Arc(Arc<File>),
 }
 
@@ -212,6 +216,7 @@ impl AsRawFd for InodeFile<'_> {
             #[cfg(target_os = "linux")]
             Self::Owned(file) => file.as_raw_fd(),
             Self::Ref(file_ref) => file_ref.as_raw_fd(),
+            #[cfg(target_os = "macos")]
             Self::Arc(arc) => arc.as_raw_fd(),
         }
     }
@@ -223,6 +228,7 @@ impl AsFd for InodeFile<'_> {
             #[cfg(target_os = "linux")]
             Self::Owned(file) => file.as_fd(),
             Self::Ref(file_ref) => file_ref.as_fd(),
+            #[cfg(target_os = "macos")]
             Self::Arc(arc) => arc.as_fd(),
         }
     }
