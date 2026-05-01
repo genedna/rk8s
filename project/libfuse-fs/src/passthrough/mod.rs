@@ -934,6 +934,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             );
             cfg.writeback = false;
         }
+        #[cfg(target_os = "macos")]
+        if cfg.macos_lazy_inode_fd {
+            cfg.root_dir = std::fs::canonicalize(&cfg.root_dir)?;
+        }
 
         // Safe because this is a constant value and a valid C string.
         let proc_self_fd_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_SELF_FD_CSTR) };
@@ -1077,8 +1081,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
     /// Initialize the Passthrough file system.
     pub async fn import(&self) -> Result<()> {
-        let root =
-            CString::new(self.cfg.root_dir.as_os_str().as_bytes()).expect("Invalid root_dir");
+        let root = CString::new(self.cfg.root_dir.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         let (handle, st) = Self::open_file_and_handle(
             self,
@@ -1853,7 +1857,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 mod tests {
     use crate::{
         passthrough::{PassthroughArgs, PassthroughFs, ROOT_ID, new_passthroughfs_layer},
-        unwrap_or_skip_eperm,
+        unwrap_or_skip_eperm, unwrap_or_skip_mount_error,
     };
     use std::ffi::{CStr, OsStr, OsString};
 
@@ -1885,17 +1889,44 @@ mod tests {
         assert_eq!(super::desired_nofile_soft_limit(8192, 16384, 8192), None);
     }
 
-    /// This test attempts to mount a passthrough filesystem. In many CI/unprivileged
-    /// environments operations like `allow_other` or FUSE mounting may return
-    /// EPERM/EACCES. Instead of failing the whole test suite, we skip the test
-    /// gracefully in that case so logic tests in other modules still run.
+    #[cfg(target_os = "macos")]
+    struct MacFuseMountCleanup {
+        mount_dir: std::path::PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for MacFuseMountCleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("umount")
+                .arg(&self.mount_dir)
+                .status();
+            let _ = std::process::Command::new("diskutil")
+                .arg("unmount")
+                .arg("force")
+                .arg(&self.mount_dir)
+                .status();
+        }
+    }
+
+    /// This test attempts to mount a passthrough filesystem. It is explicitly
+    /// gated because macFUSE availability depends on local kext approval and
+    /// should not affect the default unit-test layer.
     #[tokio::test]
     async fn test_passthrough() {
-        let temp_dir = std::env::temp_dir().join("libfuse_passthrough_test");
-        let source_dir = temp_dir.join("src");
-        let mount_dir = temp_dir.join("mnt");
-        let _ = std::fs::create_dir_all(&source_dir);
-        let _ = std::fs::create_dir_all(&mount_dir);
+        if std::env::var("RUN_MACFUSE_TESTS").ok().as_deref() != Some("1") {
+            eprintln!("skip test_passthrough: RUN_MACFUSE_TESTS!=1");
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp_dir.path().join("src");
+        let mount_dir = temp_dir.path().join("mnt");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::create_dir_all(&mount_dir).expect("create mount dir");
+        #[cfg(target_os = "macos")]
+        let _cleanup = MacFuseMountCleanup {
+            mount_dir: mount_dir.clone(),
+        };
 
         let args = PassthroughArgs {
             root_dir: source_dir.clone(),
@@ -1918,17 +1949,62 @@ mod tests {
         mount_options.uid(uid).gid(gid);
         // Intentionally DO NOT call allow_other here to avoid requiring /etc/fuse.conf config.
 
-        let mount_path = OsString::from(mount_dir.to_str().unwrap());
+        let mount_path = OsString::from(mount_dir.as_os_str());
 
         let session = Session::new(mount_options);
         let mount_handle =
-            unwrap_or_skip_eperm!(session.mount(fs, mount_path).await, "mount passthrough fs");
+            unwrap_or_skip_mount_error!(session.mount(fs, mount_path).await, "mount passthrough fs");
 
         // Immediately unmount to verify we at least mounted successfully.
         let _ = mount_handle.unmount().await; // errors ignored
+    }
 
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&temp_dir);
+    #[tokio::test]
+    async fn lookup_rejects_nul_name_without_panicking() {
+        use rfuse3::raw::{Filesystem, Request};
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let fs = new_passthroughfs_layer(PassthroughArgs {
+            root_dir: temp_dir.path(),
+            mapping: None::<&str>,
+        })
+        .await
+        .unwrap();
+
+        let err = fs
+            .lookup(
+                Request::default(),
+                ROOT_ID,
+                OsStr::from_bytes(b"bad\0name"),
+            )
+            .await
+            .unwrap_err();
+        let ioerr = std::io::Error::from(err);
+        assert_eq!(ioerr.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_lazy_new_canonicalizes_root_dir() {
+        use super::Config;
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let real_root = temp_dir.path().join("real-root");
+        let link_root = temp_dir.path().join("link-root");
+        std::fs::create_dir(&real_root).unwrap();
+        symlink(&real_root, &link_root).unwrap();
+
+        let cfg = Config {
+            root_dir: link_root.clone(),
+            macos_lazy_inode_fd: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(cfg).expect("new fs");
+
+        assert_eq!(fs.cfg.root_dir, real_root.canonicalize().unwrap());
+        assert_ne!(fs.cfg.root_dir, link_root);
     }
 
     #[cfg(target_os = "macos")]
@@ -2037,7 +2113,7 @@ mod tests {
             .unwrap();
 
         // Every descendant must now resolve under "/…/b/sub/...".
-        let new_root = temp_dir.path().to_path_buf();
+        let new_root = temp_dir.path().canonicalize().unwrap();
         for ino in [a_entry.attr.ino, sub_entry.attr.ino, file_entry.attr.ino] {
             let data = fs.inode_map.get(ino).await.unwrap();
             let path = data.lazy_path().expect("Reopenable on macOS lazy mode");
@@ -2312,6 +2388,47 @@ mod tests {
         let after_b = std::fs::read(temp_dir.path().join("b.txt")).unwrap();
         assert_eq!(after_a, b"B_PAYLOAD", "exchange did not move B's content to a.txt");
         assert_eq!(after_b, b"A_PAYLOAD", "exchange did not move A's content to b.txt");
+    }
+
+    /// Resource fork xattrs are the one macOS xattr namespace where the
+    /// kernel-supplied position matters. Preserve it instead of flattening
+    /// every write to offset 0.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_resource_fork_xattr_honors_position() {
+        use rfuse3::raw::{Filesystem, Request};
+        use std::ffi::OsStr;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("forked.txt"), b"data").unwrap();
+
+        let fs = new_passthroughfs_layer(PassthroughArgs {
+            root_dir: temp_dir.path(),
+            mapping: None::<&str>,
+        })
+        .await
+        .unwrap();
+        let entry = fs
+            .do_lookup(ROOT_ID, CStr::from_bytes_with_nul(b"forked.txt\0").unwrap())
+            .await
+            .unwrap();
+        let attr = OsStr::new("com.apple.ResourceFork");
+
+        fs.setxattr(Request::default(), entry.attr.ino, attr, b"abcd", 0, 0)
+            .await
+            .unwrap();
+        fs.setxattr(Request::default(), entry.attr.ino, attr, b"EF", 0, 2)
+            .await
+            .unwrap();
+
+        let data = fs
+            .getxattr(Request::default(), entry.attr.ino, attr, 4)
+            .await
+            .unwrap();
+        match data {
+            rfuse3::raw::reply::ReplyXAttr::Data(bytes) => assert_eq!(&bytes[..], b"abEF"),
+            other => panic!("expected resource-fork data, got {other:?}"),
+        }
     }
 
     // // Test for uid/gid mapping

@@ -9,12 +9,14 @@
 # Modes
 # -----
 #   default        single run (lazy mode, label = $LABEL or timestamp)
-#   --ab           lazy=true vs lazy=false back-to-back, prints per-job
-#                  ratio and writes both runs + ratio block to baseline.
+#   --ab           lazy=true vs lazy=false back-to-back for AB_RUNS rounds,
+#                  prints per-job median ratio, writes raw runs plus a JSON
+#                  summary artifact, and fails if gates are not met.
 #                  Aborts if any other macFUSE mount is detected (system
 #                  noise dominated past results).
 #
 # Optional env:
+#   RUN_MACFUSE_BENCH  Must be 1; otherwise the script skips.
 #   MOUNT_POINT         Default: /tmp/libfusefs-bench-mnt
 #   ROOT_DIR            Default: /tmp/libfusefs-bench-root
 #   PASSTHROUGH_BIN     Default: target/release/examples/passthrough
@@ -23,6 +25,9 @@
 #   KEEP_MOUNT          Set to 1 to leave mount up afterwards
 #   AB_ALLOW_NOISE      Set to 1 to bypass the no-other-mount precondition
 #                       (use only when you accept noisy numbers).
+#   AB_RUNS             Number of lazy/eager pairs in --ab mode. Default: 3
+#   AB_META_MIN_RATIO   Required meta-stat lazy/eager median ratio. Default: 2.0
+#   AB_IO_MAX_REGRESSION  Max allowed IO regression. Default: 0.10
 
 set -euo pipefail
 
@@ -62,6 +67,7 @@ skip() { echo "SKIP: $*" >&2; exit 0; }
 # --- env probes -------------------------------------------------------------
 
 [[ "$(uname -s)" == "Darwin" ]] || skip "not on macOS"
+[[ "${RUN_MACFUSE_BENCH:-0}" == "1" ]] || skip "RUN_MACFUSE_BENCH!=1"
 MACFUSE_BIN="/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
 [[ -x "$MACFUSE_BIN" ]] || skip "macFUSE not installed"
 command -v fio >/dev/null 2>&1 || skip "fio not installed (try: brew install fio)"
@@ -78,6 +84,12 @@ FIO_CFG="${FIO_CFG:-$REPO_ROOT/bench/fio.cfg}"
 MOUNT_POINT="${MOUNT_POINT:-/tmp/libfusefs-bench-mnt}"
 ROOT_DIR="${ROOT_DIR:-/tmp/libfusefs-bench-root}"
 LABEL="${LABEL:-$(date -u +%Y%m%dT%H%M%SZ)}"
+AB_RUNS="${AB_RUNS:-3}"
+AB_META_MIN_RATIO="${AB_META_MIN_RATIO:-2.0}"
+AB_IO_MAX_REGRESSION="${AB_IO_MAX_REGRESSION:-0.10}"
+
+[[ "$AB_RUNS" =~ ^[0-9]+$ ]] && [[ "$AB_RUNS" -gt 0 ]] \
+    || { echo "FAIL: AB_RUNS must be a positive integer" >&2; exit 1; }
 
 mkdir -p "$MOUNT_POINT" "$ROOT_DIR"
 # `mount(8)` reports realpaths (`/tmp` resolves to `/private/tmp` on macOS),
@@ -213,58 +225,150 @@ if [[ "$AB_MODE" == "1" ]]; then
         mount | awk '/macfuse/' | sed 's/^/    /' >&2
         exit 1
     fi
-    LAZY_LABEL="${LABEL}-lazy"
-    EAGER_LABEL="${LABEL}-eager"
+    lazy_jsons=()
+    eager_jsons=()
+    for run_id in $(seq 1 "$AB_RUNS"); do
+        LAZY_LABEL="${LABEL}-r${run_id}-lazy"
+        EAGER_LABEL="${LABEL}-r${run_id}-eager"
 
-    run_once "$LAZY_LABEL"
-    run_once "$EAGER_LABEL" --macos-eager
+        run_once "$LAZY_LABEL"
+        lazy_jsons+=("$REPORT_DIR/macfuse-bench-$LAZY_LABEL.json")
 
-    # Compute and append per-job ratios.
+        run_once "$EAGER_LABEL" --macos-eager
+        eager_jsons+=("$REPORT_DIR/macfuse-bench-$EAGER_LABEL.json")
+    done
+
+    SUMMARY_JSON="$REPORT_DIR/macfuse-bench-$LABEL-ab-summary.json"
     REPO_ROOT="$REPO_ROOT" CONCURRENT_MOUNTS="$CONCURRENT_MOUNTS" \
-        python3 - "$REPORT_DIR/macfuse-bench-$LAZY_LABEL.json" \
-                  "$REPORT_DIR/macfuse-bench-$EAGER_LABEL.json" \
-                  "$LABEL" <<'PYEOF'
-import json, os, sys, datetime, pathlib
+    AB_RUNS="$AB_RUNS" AB_META_MIN_RATIO="$AB_META_MIN_RATIO" \
+    AB_IO_MAX_REGRESSION="$AB_IO_MAX_REGRESSION" SUMMARY_JSON="$SUMMARY_JSON" \
+        python3 - "$LABEL" "${lazy_jsons[@]}" "::" "${eager_jsons[@]}" <<'PYEOF'
+import datetime
+import json
+import os
+import pathlib
+import statistics
+import sys
 
-def load(p):
-    raw = json.loads(pathlib.Path(p).read_text())
-    return {j.get("jobname","?"): j.get("read", {}) for j in raw.get("jobs", [])}
+label = sys.argv[1]
+sep = sys.argv.index("::")
+lazy_paths = [pathlib.Path(p) for p in sys.argv[2:sep]]
+eager_paths = [pathlib.Path(p) for p in sys.argv[sep + 1:]]
+concurrent = int(os.environ.get("CONCURRENT_MOUNTS", "0"))
+ab_runs = int(os.environ.get("AB_RUNS", "3"))
+meta_min_ratio = float(os.environ.get("AB_META_MIN_RATIO", "2.0"))
+io_max_regression = float(os.environ.get("AB_IO_MAX_REGRESSION", "0.10"))
+summary_path = pathlib.Path(os.environ["SUMMARY_JSON"])
 
-lazy_p, eager_p, run_label = sys.argv[1], sys.argv[2], sys.argv[3]
-lazy = load(lazy_p)
-eager = load(eager_p)
-concurrent = os.environ.get("CONCURRENT_MOUNTS", "?")
+def load_iops(path):
+    raw = json.loads(path.read_text())
+    return {
+        job.get("jobname", "?"): float(job.get("read", {}).get("iops", 0.0))
+        for job in raw.get("jobs", [])
+    }
 
-names = sorted(set(lazy) | set(eager))
-print()
-print(f"=== A/B ratio (lazy / eager) [{run_label}] concurrent_mounts={concurrent} ===")
-print(f"{'job':<16} {'lazy_iops':>12} {'eager_iops':>12} {'ratio':>8}")
+lazy_runs = [load_iops(p) for p in lazy_paths]
+eager_runs = [load_iops(p) for p in eager_paths]
+jobs = sorted(set().union(*(r.keys() for r in lazy_runs), *(r.keys() for r in eager_runs)))
+
 rows = []
-for n in names:
-    li = lazy.get(n, {}).get("iops", 0.0)
-    ei = eager.get(n, {}).get("iops", 0.0)
-    ratio = (li / ei) if ei > 0 else float("inf")
-    rows.append((n, li, ei, ratio))
-    print(f"{n:<16} {li:>12.1f} {ei:>12.1f} {ratio:>8.2f}x")
+failures = []
+for job in jobs:
+    lazy_vals = [r.get(job, 0.0) for r in lazy_runs]
+    eager_vals = [r.get(job, 0.0) for r in eager_runs]
+    lazy_median = statistics.median(lazy_vals)
+    eager_median = statistics.median(eager_vals)
+    ratio = lazy_median / eager_median if eager_median > 0 else None
+    min_ratio = None
+    if job == "meta-stat":
+        min_ratio = meta_min_ratio
+    elif job in ("randread-4k", "seqread-1m"):
+        min_ratio = 1.0 - io_max_regression
+    status = "ok"
+    if ratio is None:
+        status = "fail"
+        failures.append(f"{job}: eager median iops is zero")
+    elif min_ratio is not None and ratio < min_ratio:
+        status = "fail"
+        failures.append(f"{job}: ratio {ratio:.2f}x < required {min_ratio:.2f}x")
+    rows.append({
+        "job": job,
+        "lazy_iops_median": lazy_median,
+        "eager_iops_median": eager_median,
+        "ratio": ratio,
+        "required_min_ratio": min_ratio,
+        "status": status,
+    })
+
+for required in ("meta-stat", "randread-4k", "seqread-1m"):
+    if required not in jobs:
+        failures.append(f"{required}: missing from fio output")
+
+summary = {
+    "label": label,
+    "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+    "ab_runs": ab_runs,
+    "concurrent_mounts": concurrent,
+    "thresholds": {
+        "meta_stat_min_ratio": meta_min_ratio,
+        "io_min_ratio": 1.0 - io_max_regression,
+        "io_max_regression": io_max_regression,
+    },
+    "raw": {
+        "lazy": [str(p) for p in lazy_paths],
+        "eager": [str(p) for p in eager_paths],
+    },
+    "jobs": rows,
+    "failures": failures,
+}
+summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+print()
+print(f"=== A/B median ratio (lazy / eager) [{label}] runs={ab_runs} concurrent_mounts={concurrent} ===")
+print(f"{'job':<16} {'lazy_med_iops':>14} {'eager_med_iops':>15} {'ratio':>8} {'gate':>10}")
+for row in rows:
+    req = row["required_min_ratio"]
+    gate = "-" if req is None else f">={req:.2f}x"
+    ratio = row["ratio"]
+    ratio_text = "n/a" if ratio is None else f"{ratio:.2f}x"
+    print(
+        f"{row['job']:<16} {row['lazy_iops_median']:>14.1f} "
+        f"{row['eager_iops_median']:>15.1f} {ratio_text:>9} {gate:>10}"
+    )
+print(f"Summary JSON: {summary_path}")
 
 repo = pathlib.Path(os.environ.get("REPO_ROOT", "."))
 doc = repo / "docs" / "macos-performance-baseline.md"
 if doc.exists():
     block = [
         "",
-        f"### A/B `{run_label}` — {datetime.datetime.utcnow().isoformat()}Z (concurrent_mounts={concurrent})",
+        f"### A/B median `{label}` - {summary['timestamp_utc']} (runs={ab_runs}, concurrent_mounts={concurrent})",
         "",
-        "| job | lazy iops | eager iops | ratio |",
-        "| --- | ---: | ---: | ---: |",
+        "| job | lazy median iops | eager median iops | ratio | gate | status |",
+        "| --- | ---: | ---: | ---: | ---: | --- |",
     ]
-    for n, li, ei, r in rows:
-        block.append(f"| {n} | {li:.1f} | {ei:.1f} | {r:.2f}x |")
+    for row in rows:
+        req = row["required_min_ratio"]
+        gate = "-" if req is None else f">= {req:.2f}x"
+        ratio = row["ratio"]
+        ratio_text = "n/a" if ratio is None else f"{ratio:.2f}x"
+        block.append(
+            f"| {row['job']} | {row['lazy_iops_median']:.1f} | "
+            f"{row['eager_iops_median']:.1f} | {ratio_text} | "
+            f"{gate} | {row['status']} |"
+        )
+    block.append(f"\nSummary JSON: `{summary_path}`")
     with doc.open("a") as f:
         f.write("\n".join(block) + "\n")
-    print(f"Appended A/B ratios to {doc}")
+    print(f"Appended A/B median summary to {doc}")
+
+if failures:
+    print("A/B gates failed:", file=sys.stderr)
+    for failure in failures:
+        print(f"  - {failure}", file=sys.stderr)
+    sys.exit(2)
 PYEOF
-    echo "Done. Lazy: $REPORT_DIR/macfuse-bench-$LAZY_LABEL.json" >&2
-    echo "Done. Eager: $REPORT_DIR/macfuse-bench-$EAGER_LABEL.json" >&2
+    echo "Done. Summary: $SUMMARY_JSON" >&2
 else
     run_once "$LABEL"
     echo "Raw fio output: $REPORT_DIR/macfuse-bench-$LABEL.json" >&2

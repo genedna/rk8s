@@ -1755,7 +1755,9 @@ impl OverlayFs {
         mode: u32,
         flags: u32,
     ) -> Result<Option<u64>> {
-        let name_str = name.to_str().unwrap();
+        let name_str = name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
         let upper = self
             .upper_layer
             .as_ref()
@@ -1893,8 +1895,12 @@ impl OverlayFs {
         new_parent: Inode,
         new_name: &OsStr,
     ) -> Result<()> {
-        let name_str = name.to_str().unwrap();
-        let new_name_str = new_name.to_str().unwrap();
+        let name_str = name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
+        let new_name_str = new_name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
 
         let parent_node = self.lookup_node(req, parent, "").await?;
         let new_parent_node = self.lookup_node(req, new_parent, "").await?;
@@ -2586,7 +2592,9 @@ impl OverlayFs {
         if pnode.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
-        let to_name = name.to_str().unwrap();
+        let to_name = name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
 
         // 3. Locate the child Overlay Inode for the given name
         // Find the Overlay Inode for child with <name>.
@@ -2654,7 +2662,7 @@ impl OverlayFs {
         if node.in_upper_layer().await {
             pnode.handle_upper_inode_locked(&mut df).await?;
         }
-        pnode.remove_child(name.to_str().unwrap()).await;
+        pnode.remove_child(to_name).await;
         let path = node.path.read().await.clone();
         self.remove_inode(node.inode, Some(path)).await;
 

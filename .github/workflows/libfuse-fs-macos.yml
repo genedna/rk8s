@@ -6,7 +6,8 @@ name: libfuse-fs macOS
 # GitHub-hosted runners is gated on macOS version + System Integrity
 # Protection state, so the job is `continue-on-error: true` and treated
 # as advisory until we have a self-hosted runner with stable kext
-# permissions.
+# permissions. Set repository variable LIBFUSE_SELF_HOSTED_MACFUSE=1 on a
+# macFUSE-capable self-hosted runner to enable the required smoke gate.
 #
 # Full conformance / performance baselines live in
 # project/libfuse-fs/tests/conformance/run_pjdfstest.sh and
@@ -117,40 +118,53 @@ jobs:
         working-directory: project/libfuse-fs
         run: cargo build --example passthrough
 
-      - name: Smoke mount + read/write
+      - name: Smoke mount
         if: steps.install_macfuse.outputs.macfuse_ok == '1'
         working-directory: project/libfuse-fs
         env:
           KEEP_MOUNT: "0"
-        run: |
-          set -euo pipefail
-          ROOT_DIR="$RUNNER_TEMP/libfusefs-smoke-root"
-          MNT="$RUNNER_TEMP/libfusefs-smoke-mnt"
-          mkdir -p "$ROOT_DIR" "$MNT"
-          echo "hello-from-ci" > "$ROOT_DIR/marker.txt"
-
-          BIN="$(cargo metadata --no-deps --format-version 1 \
-                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/examples/passthrough"
-
-          "$BIN" --mountpoint "$MNT" --rootdir "$ROOT_DIR" &
-          PID=$!
-          trap 'kill $PID 2>/dev/null || true; for _ in 1 2 3 4 5 6; do kill -0 $PID 2>/dev/null || break; sleep 0.5; done; kill -9 $PID 2>/dev/null || true; umount "$MNT" 2>/dev/null || diskutil unmount force "$MNT" 2>/dev/null || true' EXIT
-          for _ in $(seq 1 20); do
-            if mount | grep -q " $(cd "$MNT" && pwd -P) "; then break; fi
-            sleep 0.5
-          done
-          if ! mount | grep -q " $(cd "$MNT" && pwd -P) "; then
-            echo "Mount did not come up — kext likely not loaded"
-            exit 1
-          fi
-
-          # Round-trip read of an existing file + write a new one.
-          test "$(cat "$MNT/marker.txt")" = "hello-from-ci"
-          echo "ci-write" > "$MNT/written-by-ci.txt"
-          test "$(cat "$ROOT_DIR/written-by-ci.txt")" = "ci-write"
-
-          echo "smoke OK"
+          MOUNT_POINT: ${{ runner.temp }}/libfusefs-smoke-mnt
+          ROOT_DIR: ${{ runner.temp }}/libfusefs-smoke-root
+          RUN_MACFUSE_TESTS: "1"
+          SMOKE_LOOPS: "1"
+        run: bash tests/macos_mount_smoke.sh
 
       - name: Skipped (no macFUSE)
         if: steps.install_macfuse.outputs.macfuse_ok != '1'
         run: echo "macFUSE not available on this runner — smoke skipped (advisory)"
+
+  self-hosted-mount-smoke:
+    # Required gate for a runner where macFUSE is preinstalled and approved.
+    # Kept behind a repo variable so GitHub-hosted PRs do not get stuck
+    # waiting for labels that are not present in every fork/repo.
+    if: vars.LIBFUSE_SELF_HOSTED_MACFUSE == '1'
+    runs-on: [self-hosted, macOS, macfuse]
+    needs: check
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: project/libfuse-fs
+
+      - name: Build passthrough example
+        working-directory: project/libfuse-fs
+        run: cargo build --example passthrough
+
+      - name: Smoke mount x10
+        working-directory: project/libfuse-fs
+        env:
+          KEEP_MOUNT: "0"
+          MOUNT_POINT: ${{ runner.temp }}/libfusefs-smoke-mnt
+          ROOT_DIR: ${{ runner.temp }}/libfusefs-smoke-root
+          RUN_MACFUSE_TESTS: "1"
+          SMOKE_LOOPS: "10"
+        run: bash tests/macos_mount_smoke.sh

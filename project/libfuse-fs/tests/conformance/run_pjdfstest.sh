@@ -4,6 +4,7 @@
 # Skips cleanly when macFUSE or pjdfstest aren't present; never blocks CI.
 #
 # Required env:
+#   RUN_MACFUSE_CONFORMANCE  Must be 1; otherwise the script skips.
 #   PJDFSTEST_DIR       Path to a checked-out github.com/pjd/pjdfstest tree
 #                       (with `prove`-runnable tests under tests/).
 # Optional env:
@@ -47,6 +48,9 @@ skip() {
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     skip "not running on macOS (uname=$(uname -s))"
+fi
+if [[ "${RUN_MACFUSE_CONFORMANCE:-0}" != "1" ]]; then
+    skip "RUN_MACFUSE_CONFORMANCE!=1"
 fi
 
 MACFUSE_BIN="/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"

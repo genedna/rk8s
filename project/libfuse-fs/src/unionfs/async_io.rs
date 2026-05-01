@@ -288,7 +288,9 @@ impl Filesystem for OverlayFs {
         if newpnode.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT).into());
         }
-        let new_name = new_name.to_str().unwrap();
+        let new_name = new_name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
         // trace!(
         //     "LINK: inode: {}, new_parent: {}, trying to do_link: src_inode: {}, newpnode: {}",
         //     inode, new_parent, node.inode, newpnode.inode
@@ -996,10 +998,13 @@ impl Filesystem for OverlayFs {
             }
         }
 
+        let name_str = name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
         let final_handle = self
             .do_create(req, &pnode, name, mode, flags.try_into().unwrap())
             .await?;
-        let entry = self.do_lookup(req, parent, name.to_str().unwrap()).await?;
+        let entry = self.do_lookup(req, parent, name_str).await?;
         let fh = final_handle
             .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "Handle not found"))?;
 
